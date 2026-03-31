@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import re
 import shlex
 import shutil
+import wave
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from pathlib import Path
@@ -223,6 +226,9 @@ class PipelineStage(ABC):
 
     stage_name: StageName
 
+    def completed_result_is_reusable(self, context: "PipelineContext") -> bool:
+        return True
+
     @abstractmethod
     def run(self, context: "PipelineContext") -> "StageResult":
         raise NotImplementedError
@@ -230,6 +236,157 @@ class PipelineStage(ABC):
 
 class SourceSeparationStage(PipelineStage):
     stage_name = StageName.SOURCE_SEPARATION
+    validation_version = "1"
+    silence_threshold_dbfs = -80.0
+
+    def _source_artifact_payload(
+        self,
+        *,
+        input_audio: Path,
+        vocals_path: Path,
+        instrumental_path: Path,
+        backend: str,
+        command: str,
+        raw_output_dir: Optional[Path] = None,
+    ) -> Dict[str, str]:
+        payload = {
+            "input_audio": str(input_audio),
+            "vocals": str(vocals_path),
+            "instrumental": str(instrumental_path),
+            "source_separation_backend": backend,
+            "source_separation_command": command,
+            "source_separation_validation_version": self.validation_version,
+            "input_audio_sha1": self._sha1(input_audio),
+            "vocals_sha1": self._sha1(vocals_path),
+            "instrumental_sha1": self._sha1(instrumental_path),
+            "input_audio_stream_info": json.dumps(self._probe_audio(input_audio), sort_keys=True),
+            "vocals_stream_info": json.dumps(self._probe_audio(vocals_path), sort_keys=True),
+            "instrumental_stream_info": json.dumps(self._probe_audio(instrumental_path), sort_keys=True),
+        }
+        if raw_output_dir is not None:
+            payload["source_separation_raw_output_dir"] = str(raw_output_dir)
+        return payload
+
+    def _sha1(self, path: Path) -> str:
+        digest = hashlib.sha1()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _probe_audio(self, path: Path) -> Dict[str, Any]:
+        ffprobe = require_executable("ffprobe", "Install FFmpeg to inspect separated audio.")
+        result = run_command(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,size:stream=index,codec_name,codec_type,channels,sample_rate",
+                "-of",
+                "json",
+                str(path),
+            ]
+        )
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        audio_stream = next(
+            (item for item in streams if isinstance(item, Mapping) and item.get("codec_type") == "audio"),
+            streams[0] if streams else {},
+        )
+        format_payload = payload.get("format") or {}
+        return {
+            "codec_name": str(audio_stream.get("codec_name") or ""),
+            "channels": int(audio_stream.get("channels") or 0),
+            "sample_rate": int(audio_stream.get("sample_rate") or 0),
+            "duration": str(format_payload.get("duration") or ""),
+            "size": str(format_payload.get("size") or ""),
+        }
+
+    def _audio_peak_dbfs(self, path: Path) -> float:
+        with wave.open(str(path), "rb") as handle:
+            sample_width = handle.getsampwidth()
+            if sample_width < 1:
+                raise MediaToolError(f"Unsupported sample width for {path}.")
+            peak = 0
+            while True:
+                frames = handle.readframes(4096)
+                if not frames:
+                    break
+                peak = max(peak, self._peak_sample(frames, sample_width))
+        if peak <= 0:
+            return float("-inf")
+        if sample_width == 1:
+            full_scale = 127
+        else:
+            full_scale = (1 << ((sample_width * 8) - 1)) - 1
+        return 20.0 * math.log10(peak / full_scale)
+
+    def _peak_sample(self, frames: bytes, sample_width: int) -> int:
+        data = memoryview(frames)
+        peak = 0
+        if sample_width == 1:
+            for value in data:
+                peak = max(peak, abs(value - 128))
+            return peak
+        for index in range(0, len(data), sample_width):
+            sample = int.from_bytes(data[index : index + sample_width], byteorder="little", signed=True)
+            peak = max(peak, abs(sample))
+        return peak
+
+    def _validate_outputs(
+        self,
+        *,
+        input_audio: Path,
+        vocals_path: Path,
+        instrumental_path: Path,
+        artifacts: Mapping[str, str],
+    ) -> Optional[str]:
+        for path in (vocals_path, instrumental_path):
+            if not path.exists():
+                return f"Missing expected output file: {path.name}."
+            if path.stat().st_size <= 0:
+                return f"Output file is empty: {path.name}."
+        if artifacts.get("source_separation_validation_version") != self.validation_version:
+            return "Missing source-separation provenance metadata."
+        if not artifacts.get("source_separation_backend"):
+            return "Missing source-separation backend metadata."
+        if artifacts.get("input_audio_sha1") != self._sha1(input_audio):
+            return "Input audio no longer matches the recorded separation input."
+        if self._sha1(vocals_path) == self._sha1(input_audio):
+            return "vocals.wav is identical to input_audio.wav."
+        instrumental_peak = self._audio_peak_dbfs(instrumental_path)
+        if instrumental_peak <= self.silence_threshold_dbfs:
+            return "instrumental.wav is effectively silent."
+        if artifacts.get("source_separation_backend") == "demucs":
+            raw_output_dir = artifacts.get("source_separation_raw_output_dir", "").strip()
+            if not raw_output_dir or not Path(raw_output_dir).exists():
+                return "Demucs outputs are missing raw-output provenance."
+        for key in ("input_audio_stream_info", "vocals_stream_info", "instrumental_stream_info"):
+            if not artifacts.get(key):
+                return f"Missing recorded stream metadata: {key}."
+        return None
+
+    def completed_result_is_reusable(self, context: "PipelineContext") -> bool:
+        stage_dir = context.stage_dir(self.stage_name)
+        input_audio = stage_dir / "input_audio.wav"
+        vocals_path = stage_dir / "vocals.wav"
+        instrumental_path = stage_dir / "instrumental.wav"
+        if not input_audio.exists():
+            return False
+        artifacts = context.stage_artifacts(self.stage_name)
+        return (
+            self._validate_outputs(
+                input_audio=input_audio,
+                vocals_path=vocals_path,
+                instrumental_path=instrumental_path,
+                artifacts=artifacts,
+            )
+            is None
+        )
 
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
@@ -249,25 +406,42 @@ class SourceSeparationStage(PipelineStage):
 
         vocals_path = stage_dir / "vocals.wav"
         instrumental_path = stage_dir / "instrumental.wav"
+        existing_artifacts = dict(context.stage_artifacts(self.stage_name))
+        invalid_existing_message = ""
         if vocals_path.exists() and instrumental_path.exists():
-            return StageResult(
-                self.stage_name,
-                StageStatus.COMPLETED,
-                artifacts={
-                    "input_audio": str(input_audio),
-                    "vocals": str(vocals_path),
-                    "instrumental": str(instrumental_path),
-                },
+            invalid_existing_message = self._validate_outputs(
+                input_audio=input_audio,
+                vocals_path=vocals_path,
+                instrumental_path=instrumental_path,
+                artifacts=existing_artifacts,
             )
+            if invalid_existing_message is None:
+                return StageResult(
+                    self.stage_name,
+                    StageStatus.COMPLETED,
+                    artifacts=existing_artifacts,
+                )
+            vocals_path.unlink(missing_ok=True)
+            instrumental_path.unlink(missing_ok=True)
 
         runner_name = (context.settings.source_separation_runner or "auto").strip().lower()
         command_template = context.settings.source_separation_command.strip()
+        validation_prefix = ""
+        if invalid_existing_message:
+            validation_prefix = (
+                f"Existing source-separation outputs are invalid: {invalid_existing_message} "
+            )
+        artifacts: Dict[str, str] = {"input_audio": str(input_audio)}
+        backend_name = ""
+        command_used = ""
+        raw_output_dir: Optional[Path] = None
         if not command_template:
             if runner_name not in {"", "auto", "demucs"}:
                 return StageResult(
                     self.stage_name,
                     StageStatus.NEEDS_REVIEW,
-                    "Configured source_separation_runner "
+                    validation_prefix
+                    + "Configured source_separation_runner "
                     f"'{context.settings.source_separation_runner}' is not implemented. "
                     "Use source_separation_command for a custom backend, or set the runner "
                     "to auto and install demucs.",
@@ -276,28 +450,36 @@ class SourceSeparationStage(PipelineStage):
             demucs = which("demucs")
             if demucs:
                 demucs_output = stage_dir / "demucs_output"
+                shutil.rmtree(demucs_output, ignore_errors=True)
+                demucs_command = [
+                    demucs,
+                    "--two-stems",
+                    "vocals",
+                    "-o",
+                    str(demucs_output),
+                    str(input_audio),
+                ]
                 run_command(
-                    [
-                        demucs,
-                        "--two-stems",
-                        "vocals",
-                        "-o",
-                        str(demucs_output),
-                        str(input_audio),
-                    ]
+                    demucs_command
                 )
                 located = _find_demucs_stems(demucs_output, input_audio)
                 if located:
                     _copy_stem(located["vocals"], vocals_path)
                     _copy_stem(located["instrumental"], instrumental_path)
+                    backend_name = "demucs"
+                    command_used = " ".join(demucs_command)
+                    raw_output_dir = demucs_output
             else:
                 return StageResult(
                     self.stage_name,
                     StageStatus.NEEDS_REVIEW,
-                    "No source-separation backend was auto-detected. Install a supported CLI backend such as demucs and rerun. The job-folder input and output paths are handled automatically by the script.",
+                    validation_prefix
+                    + "No source-separation backend was auto-detected. Install a supported CLI backend such as demucs and rerun. The job-folder input and output paths are handled automatically by the script.",
                     {"input_audio": str(input_audio)},
                 )
         else:
+            vocals_path.unlink(missing_ok=True)
+            instrumental_path.unlink(missing_ok=True)
             command = command_template.format(
                 input_video=str(context.source_media.video_path),
                 input_audio=str(input_audio),
@@ -306,19 +488,33 @@ class SourceSeparationStage(PipelineStage):
                 instrumental_path=str(instrumental_path),
             )
             run_command(shlex.split(command))
+            backend_name = "custom"
+            command_used = command
 
         if not vocals_path.exists() or not instrumental_path.exists():
             raise MediaToolError(
                 "Source separation completed but did not create vocals.wav and instrumental.wav."
             )
+        artifacts = self._source_artifact_payload(
+            input_audio=input_audio,
+            vocals_path=vocals_path,
+            instrumental_path=instrumental_path,
+            backend=backend_name or "unknown",
+            command=command_used,
+            raw_output_dir=raw_output_dir,
+        )
+        validation_error = self._validate_outputs(
+            input_audio=input_audio,
+            vocals_path=vocals_path,
+            instrumental_path=instrumental_path,
+            artifacts=artifacts,
+        )
+        if validation_error is not None:
+            raise MediaToolError(f"Source separation outputs failed validation: {validation_error}")
         return StageResult(
             self.stage_name,
             StageStatus.COMPLETED,
-            artifacts={
-                "input_audio": str(input_audio),
-                "vocals": str(vocals_path),
-                "instrumental": str(instrumental_path),
-            },
+            artifacts=artifacts,
         )
 
 

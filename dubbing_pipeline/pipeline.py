@@ -102,7 +102,8 @@ class PipelineRunner:
     def run(self, *, resume: bool = True) -> JobManifest:
         for stage in self.stages:
             if resume and self.context.stage_status(stage.stage_name) == StageStatus.COMPLETED:
-                continue
+                if stage.completed_result_is_reusable(self.context):
+                    continue
 
             self.context.manifest = update_stage_status(
                 self.context.manifest,

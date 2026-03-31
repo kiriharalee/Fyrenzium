@@ -134,7 +134,7 @@ def extract_audio_from_video(
     output_audio: Path,
     *,
     sample_rate: int = 48000,
-    channels: int = 1,
+    channels: int = 2,
 ) -> Path:
     ffmpeg = require_executable("ffmpeg", "Install FFmpeg to extract and mux media.")
     ensure_parent_dir(output_audio)
