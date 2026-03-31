@@ -132,7 +132,7 @@ def from_json_dict(data: Dict[str, Any]) -> JobManifest:
     settings = PipelineSettings(
         source_language=settings_data.get("source_language", "ru"),
         target_language=settings_data.get("target_language", "en"),
-        source_separation_runner=settings_data.get("source_separation_runner", "uvr5"),
+        source_separation_runner=settings_data.get("source_separation_runner", "auto"),
         source_separation_command=settings_data.get("source_separation_command", ""),
         elevenlabs_api_key_env=settings_data.get("elevenlabs_api_key_env", "ELEVENLABS_API_KEY"),
         elevenlabs_scribe_model=settings_data.get("elevenlabs_scribe_model", "scribe_v2"),

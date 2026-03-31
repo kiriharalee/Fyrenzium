@@ -33,7 +33,6 @@ python3 dubbing_pipeline.py
 The script will ask for:
 
 - source video and optional source audio
-- source-separation command template
 - ElevenLabs and OpenRouter settings
 - glossary/keyterms
 - speaker-to-voice mappings when you resume after PVC creation
@@ -43,7 +42,7 @@ The script will ask for:
 - Python 3.9+
 - FFmpeg on `PATH`
 - Optional: Rubber Band on `PATH` for higher-quality time stretching
-- An external UVR or compatible Mel-RoFormer runner available through the command template you provide
+- A supported source-separation backend on `PATH`
 - ElevenLabs API key
 - OpenRouter API key
 
@@ -61,3 +60,5 @@ Approve every row, then rerun the wizard to continue.
 - The translation model defaults to `qwen/qwen3.6-plus-preview:free`.
 - If OpenRouter rate-limits or rejects that model, the translation stage will prompt you to retry, switch models, or stop.
 - Voice prep generates per-speaker sample packs and pauses until you supply ElevenLabs `voice_id` mappings.
+- The script manages extracted audio and stage outputs inside the job folder automatically.
+- For source separation, the script first tries an advanced custom command if one exists in the manifest; otherwise it auto-detects a supported CLI backend such as `demucs`.

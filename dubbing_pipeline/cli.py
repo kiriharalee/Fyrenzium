@@ -143,10 +143,8 @@ def collect_pipeline_settings() -> PipelineSettings:
     return PipelineSettings(
         source_language=prompt_text("Source language code", "ru"),
         target_language=prompt_text("Target language code", "en"),
-        source_separation_runner=prompt_text("Source separation runner label", "uvr5"),
-        source_separation_command=prompt_text(
-            "Source separation command template", "", required=False
-        ),
+        source_separation_runner="auto",
+        source_separation_command="",
         elevenlabs_api_key_env=prompt_text("ElevenLabs API key environment variable", "ELEVENLABS_API_KEY"),
         elevenlabs_scribe_model=prompt_text("ElevenLabs Scribe model", "scribe_v2"),
         elevenlabs_tts_model=prompt_text("ElevenLabs TTS model", "eleven_multilingual_v2"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from pathlib import Path
@@ -199,6 +200,24 @@ def review_rows_complete(rows: Sequence[Any]) -> bool:
     return bool(rows) and all(bool(getattr(row, "approved", False)) for row in rows)
 
 
+def _copy_stem(source: Path, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    return target
+
+
+def _find_demucs_stems(output_root: Path, input_audio: Path) -> Optional[Dict[str, Path]]:
+    stem_name = input_audio.stem
+    vocals_candidates = sorted(output_root.rglob(f"{stem_name}/vocals.wav"))
+    instrumental_candidates = sorted(output_root.rglob(f"{stem_name}/no_vocals.wav"))
+    if not vocals_candidates or not instrumental_candidates:
+        return None
+    return {
+        "vocals": vocals_candidates[0],
+        "instrumental": instrumental_candidates[0],
+    }
+
+
 class PipelineStage(ABC):
     """Base class for pipeline stages."""
 
@@ -218,7 +237,10 @@ class SourceSeparationStage(PipelineStage):
         stage_dir = context.stage_dir(self.stage_name)
         input_audio = stage_dir / "input_audio.wav"
         source_audio = context.source_media.audio_path
-        if source_audio:
+        if input_audio.exists():
+            # Reuse a previously prepared job-local input track when resuming.
+            pass
+        elif source_audio:
             input_audio.parent.mkdir(parents=True, exist_ok=True)
             if input_audio != source_audio:
                 input_audio.write_bytes(source_audio.read_bytes())
@@ -227,23 +249,64 @@ class SourceSeparationStage(PipelineStage):
 
         vocals_path = stage_dir / "vocals.wav"
         instrumental_path = stage_dir / "instrumental.wav"
-        command_template = context.settings.source_separation_command.strip()
-        if not command_template:
+        if vocals_path.exists() and instrumental_path.exists():
             return StageResult(
                 self.stage_name,
-                StageStatus.NEEDS_REVIEW,
-                "Add a source separation command template, then rerun.",
-                {"input_audio": str(input_audio)},
+                StageStatus.COMPLETED,
+                artifacts={
+                    "input_audio": str(input_audio),
+                    "vocals": str(vocals_path),
+                    "instrumental": str(instrumental_path),
+                },
             )
 
-        command = command_template.format(
-            input_video=str(context.source_media.video_path),
-            input_audio=str(input_audio),
-            output_dir=str(stage_dir),
-            vocals_path=str(vocals_path),
-            instrumental_path=str(instrumental_path),
-        )
-        run_command(shlex.split(command))
+        runner_name = (context.settings.source_separation_runner or "auto").strip().lower()
+        command_template = context.settings.source_separation_command.strip()
+        if not command_template:
+            if runner_name not in {"", "auto", "demucs"}:
+                return StageResult(
+                    self.stage_name,
+                    StageStatus.NEEDS_REVIEW,
+                    "Configured source_separation_runner "
+                    f"'{context.settings.source_separation_runner}' is not implemented. "
+                    "Use source_separation_command for a custom backend, or set the runner "
+                    "to auto and install demucs.",
+                    {"input_audio": str(input_audio)},
+                )
+            demucs = which("demucs")
+            if demucs:
+                demucs_output = stage_dir / "demucs_output"
+                run_command(
+                    [
+                        demucs,
+                        "--two-stems",
+                        "vocals",
+                        "-o",
+                        str(demucs_output),
+                        str(input_audio),
+                    ]
+                )
+                located = _find_demucs_stems(demucs_output, input_audio)
+                if located:
+                    _copy_stem(located["vocals"], vocals_path)
+                    _copy_stem(located["instrumental"], instrumental_path)
+            else:
+                return StageResult(
+                    self.stage_name,
+                    StageStatus.NEEDS_REVIEW,
+                    "No source-separation backend was auto-detected. Install a supported CLI backend such as demucs and rerun. The job-folder input and output paths are handled automatically by the script.",
+                    {"input_audio": str(input_audio)},
+                )
+        else:
+            command = command_template.format(
+                input_video=str(context.source_media.video_path),
+                input_audio=str(input_audio),
+                output_dir=str(stage_dir),
+                vocals_path=str(vocals_path),
+                instrumental_path=str(instrumental_path),
+            )
+            run_command(shlex.split(command))
+
         if not vocals_path.exists() or not instrumental_path.exists():
             raise MediaToolError(
                 "Source separation completed but did not create vocals.wav and instrumental.wav."

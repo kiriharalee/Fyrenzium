@@ -121,7 +121,7 @@ class PipelineSettings:
 
     source_language: str = "ru"
     target_language: str = "en"
-    source_separation_runner: str = "uvr5"
+    source_separation_runner: str = "auto"
     source_separation_command: str = ""
     elevenlabs_api_key_env: str = "ELEVENLABS_API_KEY"
     elevenlabs_scribe_model: str = "scribe_v2"
