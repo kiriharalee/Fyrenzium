@@ -1,0 +1,3 @@
+# Fyrenzium
+
+Initial repository setup.
