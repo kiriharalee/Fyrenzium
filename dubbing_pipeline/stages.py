@@ -64,6 +64,22 @@ def read_json(path: Path, default: Any = None) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def sha1_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable_hash(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
+
+
 def extract_words(payload: Mapping[str, Any]) -> List[TranscriptWord]:
     candidates: Iterable[Any] = payload.get("words") or []
     if not candidates:
@@ -844,6 +860,41 @@ class VoicePrepStage(PipelineStage):
 class SynthesisStage(PipelineStage):
     stage_name = StageName.SYNTHESIS
 
+    def _inputs_fingerprint(self, context: "PipelineContext", translations_path: Path) -> str:
+        return stable_hash(
+            {
+                "translations_sha1": sha1_file(translations_path),
+                "speaker_voice_map": context.settings.speaker_voice_map,
+                "tts_model": context.settings.elevenlabs_tts_model,
+            }
+        )
+
+    def completed_result_is_reusable(self, context: "PipelineContext") -> bool:
+        translations_path = context.stage_artifact_path(StageName.TRANSLATION_REVIEW, "approved_translations")
+        synthesis_path = context.stage_artifact_path(self.stage_name, "synthesis_manifest")
+        if translations_path is None or synthesis_path is None:
+            return False
+        if not translations_path.exists() or not synthesis_path.exists():
+            return False
+
+        artifacts = context.stage_artifacts(self.stage_name)
+        if artifacts.get("synthesis_inputs_fingerprint") != self._inputs_fingerprint(context, translations_path):
+            return False
+
+        items = read_json(synthesis_path, default=[]) or []
+        if not items:
+            return False
+
+        for item in items:
+            audio_path = item.get("audio_path")
+            speaker = str(item.get("speaker") or "")
+            voice_id = str(item.get("voice_id") or "")
+            if not audio_path or not Path(audio_path).exists():
+                return False
+            if not speaker or context.settings.speaker_voice_map.get(speaker) != voice_id:
+                return False
+        return True
+
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
 
@@ -886,15 +937,49 @@ class SynthesisStage(PipelineStage):
             )
         synthesis_manifest = stage_dir / "synthesis_manifest.json"
         write_json(synthesis_manifest, manifest_entries)
+        inputs_fingerprint = self._inputs_fingerprint(context, translations_path)
         return StageResult(
             self.stage_name,
             StageStatus.COMPLETED,
-            artifacts={"synthesis_manifest": str(synthesis_manifest)},
+            artifacts={
+                "synthesis_manifest": str(synthesis_manifest),
+                "synthesis_inputs_fingerprint": inputs_fingerprint,
+            },
         )
 
 
 class AlignmentStage(PipelineStage):
     stage_name = StageName.ALIGNMENT
+
+    def _inputs_fingerprint(self, context: "PipelineContext", synthesis_path: Path) -> str:
+        return stable_hash(
+            {
+                "synthesis_manifest_sha1": sha1_file(synthesis_path),
+                "max_duration_stretch": context.settings.max_duration_stretch,
+            }
+        )
+
+    def completed_result_is_reusable(self, context: "PipelineContext") -> bool:
+        synthesis_path = context.stage_artifact_path(StageName.SYNTHESIS, "synthesis_manifest")
+        alignment_manifest = context.stage_artifact_path(self.stage_name, "alignment_manifest")
+        if synthesis_path is None or alignment_manifest is None:
+            return False
+        if not synthesis_path.exists() or not alignment_manifest.exists():
+            return False
+
+        artifacts = context.stage_artifacts(self.stage_name)
+        if artifacts.get("alignment_inputs_fingerprint") != self._inputs_fingerprint(context, synthesis_path):
+            return False
+
+        items = read_json(alignment_manifest, default=[]) or []
+        if not items:
+            return False
+
+        for item in items:
+            audio_path = item.get("audio_path")
+            if not audio_path or not Path(audio_path).exists():
+                return False
+        return True
 
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
@@ -945,15 +1030,54 @@ class AlignmentStage(PipelineStage):
             )
         alignment_manifest = stage_dir / "alignment_manifest.json"
         write_json(alignment_manifest, aligned)
+        inputs_fingerprint = self._inputs_fingerprint(context, synthesis_path)
         return StageResult(
             self.stage_name,
             StageStatus.COMPLETED,
-            artifacts={"alignment_manifest": str(alignment_manifest)},
+            artifacts={
+                "alignment_manifest": str(alignment_manifest),
+                "alignment_inputs_fingerprint": inputs_fingerprint,
+            },
         )
 
 
 class FinalMixStage(PipelineStage):
     stage_name = StageName.FINAL_MIX
+
+    def _inputs_fingerprint(
+        self,
+        alignment_manifest: Path,
+        instrumental_path: Path,
+    ) -> str:
+        return stable_hash(
+            {
+                "alignment_manifest_sha1": sha1_file(alignment_manifest),
+                "instrumental_sha1": sha1_file(instrumental_path),
+            }
+        )
+
+    def completed_result_is_reusable(self, context: "PipelineContext") -> bool:
+        alignment_manifest = context.stage_artifact_path(StageName.ALIGNMENT, "alignment_manifest")
+        instrumental_path = context.stage_artifact_path(StageName.SOURCE_SEPARATION, "instrumental")
+        final_manifest = context.stage_artifact_path(self.stage_name, "final_manifest")
+        if alignment_manifest is None or instrumental_path is None or final_manifest is None:
+            return False
+        if not alignment_manifest.exists() or not instrumental_path.exists() or not final_manifest.exists():
+            return False
+
+        artifacts = context.stage_artifacts(self.stage_name)
+        if artifacts.get("final_mix_inputs_fingerprint") != self._inputs_fingerprint(
+            alignment_manifest,
+            instrumental_path,
+        ):
+            return False
+
+        payload = read_json(final_manifest, default={}) or {}
+        for key in ("voice_mix", "final_audio", "final_video"):
+            output_path = payload.get(key)
+            if not output_path or not Path(output_path).exists():
+                return False
+        return True
 
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
@@ -992,10 +1116,15 @@ class FinalMixStage(PipelineStage):
                 "final_video": str(final_video),
             },
         )
+        inputs_fingerprint = self._inputs_fingerprint(alignment_manifest, instrumental_path)
         return StageResult(
             self.stage_name,
             StageStatus.COMPLETED,
-            artifacts={"final_manifest": str(final_manifest), "final_video": str(final_video)},
+            artifacts={
+                "final_manifest": str(final_manifest),
+                "final_video": str(final_video),
+                "final_mix_inputs_fingerprint": inputs_fingerprint,
+            },
         )
 
 

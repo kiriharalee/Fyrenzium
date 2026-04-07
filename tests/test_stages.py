@@ -7,8 +7,11 @@ from dubbing_pipeline.media import extract_audio_from_video
 from dubbing_pipeline.models import PipelineSettings, SourceMedia, StageName, StageStatus, TranscriptWord
 from dubbing_pipeline.pipeline import PipelineRunner, StageResult, build_context
 from dubbing_pipeline.stages import (
+    AlignmentStage,
+    FinalMixStage,
     PipelineStage,
     SourceSeparationStage,
+    SynthesisStage,
     build_segments,
     estimate_syllables,
     parse_translation_content,
@@ -266,6 +269,189 @@ class StageHelperTests(unittest.TestCase):
         command = run_mock.call_args.args[0]
         self.assertIn("-ac", command)
         self.assertEqual(command[command.index("-ac") + 1], "2")
+
+    def test_synthesis_reuse_rejects_changed_voice_mapping(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            approved_translations = job_dir / "03_translation_review" / "translation_segments_approved.json"
+            approved_translations.parent.mkdir(parents=True, exist_ok=True)
+            approved_translations.write_text(
+                '[{"segment_id":"s0001","speaker":"speaker_1","start_sec":0.0,"end_sec":1.0,"source_text":"privet","translated_text":"hello"}]\n',
+                encoding="utf-8",
+            )
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(speaker_voice_map={"speaker_1": "voice-old"}),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.TRANSLATION_REVIEW,
+                StageStatus.COMPLETED,
+                "done",
+                {"approved_translations": str(approved_translations)},
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {"elevenlabs": "test-key"})
+
+            def fake_save_speech_to_file(text, voice_id, output_path, **kwargs):
+                path = Path(output_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"{voice_id}:{text}".encode("utf-8"))
+                return path
+
+            with patch("dubbing_pipeline.stages.ffprobe_duration_seconds", return_value=0.8), patch.object(
+                SynthesisStage, "completed_result_is_reusable", return_value=False
+            ), patch(
+                "dubbing_pipeline.stages.ElevenLabsClient.save_speech_to_file",
+                side_effect=fake_save_speech_to_file,
+            ):
+                result = SynthesisStage().run(context)
+
+            manifest = update_stage_status(
+                context.manifest,
+                StageName.SYNTHESIS,
+                result.status,
+                result.message,
+                result.artifacts,
+            )
+            save_manifest(manifest)
+            reusable_context = build_context(job_dir, {"elevenlabs": "test-key"})
+            self.assertTrue(SynthesisStage().completed_result_is_reusable(reusable_context))
+
+            reusable_context.manifest.settings.speaker_voice_map["speaker_1"] = "voice-new"
+            self.assertFalse(SynthesisStage().completed_result_is_reusable(reusable_context))
+
+    def test_alignment_reuse_rejects_changed_synthesis_manifest(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            synthesis_manifest = job_dir / "04_synthesis" / "synthesis_manifest.json"
+            audio_path = job_dir / "04_synthesis" / "speaker_1" / "s0001.mp3"
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
+            audio_path.write_bytes(b"audio")
+            synthesis_manifest.write_text(
+                f'[{{"segment_id":"s0001","speaker":"speaker_1","voice_id":"voice-old","start_sec":0.0,"target_duration_sec":1.0,"audio_path":"{audio_path}","duration_sec":0.8}}]\n',
+                encoding="utf-8",
+            )
+            alignment_manifest = job_dir / "05_alignment" / "alignment_manifest.json"
+            aligned_path = job_dir / "05_alignment" / "s0001_aligned.wav"
+            aligned_path.parent.mkdir(parents=True, exist_ok=True)
+            aligned_path.write_bytes(b"aligned")
+            alignment_manifest.write_text(
+                f'[{{"segment_id":"s0001","speaker":"speaker_1","start_sec":0.0,"audio_path":"{aligned_path}"}}]\n',
+                encoding="utf-8",
+            )
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(max_duration_stretch=0.4),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.SYNTHESIS,
+                StageStatus.COMPLETED,
+                "done",
+                {"synthesis_manifest": str(synthesis_manifest)},
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {})
+            alignment_stage = AlignmentStage()
+            manifest = update_stage_status(
+                manifest,
+                StageName.ALIGNMENT,
+                StageStatus.COMPLETED,
+                "done",
+                {
+                    "alignment_manifest": str(alignment_manifest),
+                    "alignment_inputs_fingerprint": alignment_stage._inputs_fingerprint(context, synthesis_manifest),
+                },
+            )
+            save_manifest(manifest)
+
+            reusable_context = build_context(job_dir, {})
+            self.assertTrue(alignment_stage.completed_result_is_reusable(reusable_context))
+
+            synthesis_manifest.write_text(
+                f'[{{"segment_id":"s0001","speaker":"speaker_1","voice_id":"voice-new","start_sec":0.0,"target_duration_sec":1.0,"audio_path":"{audio_path}","duration_sec":0.8}}]\n',
+                encoding="utf-8",
+            )
+            self.assertFalse(alignment_stage.completed_result_is_reusable(reusable_context))
+
+    def test_final_mix_reuse_rejects_changed_alignment_manifest(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            alignment_manifest = job_dir / "05_alignment" / "alignment_manifest.json"
+            aligned_path = job_dir / "05_alignment" / "s0001_aligned.wav"
+            aligned_path.parent.mkdir(parents=True, exist_ok=True)
+            aligned_path.write_bytes(b"aligned")
+            alignment_manifest.write_text(
+                f'[{{"segment_id":"s0001","speaker":"speaker_1","start_sec":0.0,"audio_path":"{aligned_path}"}}]\n',
+                encoding="utf-8",
+            )
+            instrumental_path = job_dir / "01_source" / "instrumental.wav"
+            instrumental_path.parent.mkdir(parents=True, exist_ok=True)
+            instrumental_path.write_bytes(b"instrumental")
+            final_manifest = job_dir / "06_mix" / "final_manifest.json"
+            voice_mix = job_dir / "06_mix" / "english_voice_normalized.wav"
+            final_audio = job_dir / "06_mix" / "final_mix_normalized.wav"
+            final_video = job_dir / "06_mix" / "output.mp4"
+            final_manifest.parent.mkdir(parents=True, exist_ok=True)
+            for path in (voice_mix, final_audio, final_video):
+                path.write_bytes(b"output")
+            final_manifest.write_text(
+                (
+                    "{\n"
+                    f'  "voice_mix": "{voice_mix}",\n'
+                    f'  "final_audio": "{final_audio}",\n'
+                    f'  "final_video": "{final_video}"\n'
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.ALIGNMENT,
+                StageStatus.COMPLETED,
+                "done",
+                {"alignment_manifest": str(alignment_manifest)},
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.SOURCE_SEPARATION,
+                StageStatus.COMPLETED,
+                "done",
+                {"instrumental": str(instrumental_path)},
+            )
+            final_mix_stage = FinalMixStage()
+            manifest = update_stage_status(
+                manifest,
+                StageName.FINAL_MIX,
+                StageStatus.COMPLETED,
+                "done",
+                {
+                    "final_manifest": str(final_manifest),
+                    "final_video": str(final_video),
+                    "final_mix_inputs_fingerprint": final_mix_stage._inputs_fingerprint(
+                        alignment_manifest,
+                        instrumental_path,
+                    ),
+                },
+            )
+            save_manifest(manifest)
+
+            reusable_context = build_context(job_dir, {})
+            self.assertTrue(final_mix_stage.completed_result_is_reusable(reusable_context))
+
+            alignment_manifest.write_text("[]\n", encoding="utf-8")
+            self.assertFalse(final_mix_stage.completed_result_is_reusable(reusable_context))
 
 
 if __name__ == "__main__":
