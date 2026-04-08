@@ -118,6 +118,12 @@ def build_settings(
     auto_approve_transcript_review: bool = False,
     auto_approve_translation_review: bool = False,
     auto_voice_id: str = "",
+    auto_clone_voices: bool = True,
+    voice_clone_prefix: str = "fyrenzium",
+    voice_clone_min_seconds: float = 60.0,
+    voice_clone_target_seconds: float = 120.0,
+    voice_clone_max_seconds: float = 300.0,
+    voice_clone_remove_background_noise: bool = False,
     allow_alignment_overflow: bool = False,
     estimated_speakers: Optional[int] = None,
     syllables_per_second: float = 4.5,
@@ -142,6 +148,12 @@ def build_settings(
         auto_approve_transcript_review=auto_approve_transcript_review,
         auto_approve_translation_review=auto_approve_translation_review,
         auto_voice_id=auto_voice_id,
+        auto_clone_voices=auto_clone_voices,
+        voice_clone_prefix=voice_clone_prefix,
+        voice_clone_min_seconds=voice_clone_min_seconds,
+        voice_clone_target_seconds=voice_clone_target_seconds,
+        voice_clone_max_seconds=voice_clone_max_seconds,
+        voice_clone_remove_background_noise=voice_clone_remove_background_noise,
         allow_alignment_overflow=allow_alignment_overflow,
         estimated_speakers=estimated_speakers,
         syllables_per_second=syllables_per_second,
@@ -366,6 +378,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--voice-id", help="ElevenLabs voice_id to use for every speaker in one-run mode.")
     parser.add_argument(
+        "--disable-auto-clone-voices",
+        action="store_true",
+        help="Skip automatic per-speaker voice cloning and require manual voice IDs or auto-selected voices.",
+    )
+    parser.add_argument(
+        "--voice-clone-prefix",
+        default="fyrenzium",
+        help="Prefix used when naming automatically created ElevenLabs voice clones.",
+    )
+    parser.add_argument(
+        "--voice-clone-min-seconds",
+        type=float,
+        default=60.0,
+        help="Minimum combined clean sample duration per speaker for automatic cloning.",
+    )
+    parser.add_argument(
+        "--voice-clone-target-seconds",
+        type=float,
+        default=120.0,
+        help="Target combined clean sample duration per speaker for automatic cloning.",
+    )
+    parser.add_argument(
+        "--voice-clone-max-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum combined clean sample duration per speaker for automatic cloning.",
+    )
+    parser.add_argument(
+        "--voice-clone-remove-background-noise",
+        action="store_true",
+        help="Enable ElevenLabs background-noise removal when creating automatic voice clones.",
+    )
+    parser.add_argument(
         "--auto-select-voice",
         action="store_true",
         help="Automatically choose the first available ElevenLabs voice when needed.",
@@ -439,6 +484,12 @@ def build_settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         auto_approve_transcript_review=args.one_run,
         auto_approve_translation_review=args.one_run,
         auto_voice_id=args.voice_id or "",
+        auto_clone_voices=not args.disable_auto_clone_voices,
+        voice_clone_prefix=args.voice_clone_prefix,
+        voice_clone_min_seconds=args.voice_clone_min_seconds,
+        voice_clone_target_seconds=args.voice_clone_target_seconds,
+        voice_clone_max_seconds=args.voice_clone_max_seconds,
+        voice_clone_remove_background_noise=bool(args.voice_clone_remove_background_noise),
         allow_alignment_overflow=bool(args.allow_alignment_overflow or args.one_run),
         estimated_speakers=estimated_speakers,
         syllables_per_second=args.syllables_per_second,
@@ -467,6 +518,24 @@ def apply_noninteractive_overrides(job_dir: Path, args: argparse.Namespace) -> N
             changed = True
     if args.voice_id and manifest.settings.auto_voice_id != args.voice_id:
         manifest.settings.auto_voice_id = args.voice_id
+        changed = True
+    if args.disable_auto_clone_voices and manifest.settings.auto_clone_voices:
+        manifest.settings.auto_clone_voices = False
+        changed = True
+    if args.voice_clone_prefix and manifest.settings.voice_clone_prefix != args.voice_clone_prefix:
+        manifest.settings.voice_clone_prefix = args.voice_clone_prefix
+        changed = True
+    if manifest.settings.voice_clone_min_seconds != args.voice_clone_min_seconds:
+        manifest.settings.voice_clone_min_seconds = args.voice_clone_min_seconds
+        changed = True
+    if manifest.settings.voice_clone_target_seconds != args.voice_clone_target_seconds:
+        manifest.settings.voice_clone_target_seconds = args.voice_clone_target_seconds
+        changed = True
+    if manifest.settings.voice_clone_max_seconds != args.voice_clone_max_seconds:
+        manifest.settings.voice_clone_max_seconds = args.voice_clone_max_seconds
+        changed = True
+    if args.voice_clone_remove_background_noise and not manifest.settings.voice_clone_remove_background_noise:
+        manifest.settings.voice_clone_remove_background_noise = True
         changed = True
     if args.translation_model and manifest.settings.translation_model != args.translation_model:
         manifest.settings.translation_model = args.translation_model

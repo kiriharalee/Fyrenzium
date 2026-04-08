@@ -73,7 +73,7 @@ def _read_audio_source(source: AudioSource, filename: Optional[str] = None) -> T
 def _stringify(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, dict)):
         return json.dumps(value, ensure_ascii=False)
     if value is None:
         return ""
@@ -82,7 +82,7 @@ def _stringify(value: Any) -> str:
 
 def _build_multipart_form(
     fields: Mapping[str, Any],
-    files: Mapping[str, Tuple[str, bytes, str]],
+    files: Mapping[str, Union[Tuple[str, bytes, str], Sequence[Tuple[str, bytes, str]]]],
 ) -> Tuple[bytes, str]:
     boundary = base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
     parts = []
@@ -93,14 +93,19 @@ def _build_multipart_form(
         parts.append(_stringify(value).encode("utf-8"))
         parts.append(b"\r\n")
 
-    for name, (filename, content, content_type) in files.items():
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(
-            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8")
-        )
-        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
-        parts.append(content)
-        parts.append(b"\r\n")
+    for name, raw_file_value in files.items():
+        if isinstance(raw_file_value, tuple):
+            file_items = [raw_file_value]
+        else:
+            file_items = list(raw_file_value)
+        for filename, content, content_type in file_items:
+            parts.append(f"--{boundary}\r\n".encode("utf-8"))
+            parts.append(
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8")
+            )
+            parts.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+            parts.append(content)
+            parts.append(b"\r\n")
 
     parts.append(f"--{boundary}--\r\n".encode("utf-8"))
     body = b"".join(parts)
@@ -146,7 +151,9 @@ class ElevenLabsClient:
         *,
         json_body: Optional[Mapping[str, Any]] = None,
         multipart_fields: Optional[Mapping[str, Any]] = None,
-        multipart_files: Optional[Mapping[str, Tuple[str, bytes, str]]] = None,
+        multipart_files: Optional[
+            Mapping[str, Union[Tuple[str, bytes, str], Sequence[Tuple[str, bytes, str]]]]
+        ] = None,
         accept_json: bool = True,
         extra_headers: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
@@ -254,6 +261,48 @@ class ElevenLabsClient:
         if isinstance(response.body, dict):
             return response.body
         raise ElevenLabsError("transcription did not return JSON")
+
+    def create_voice_clone(
+        self,
+        *,
+        name: str,
+        audio_files: Sequence[AudioSource],
+        description: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        remove_background_noise: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if not name.strip():
+            raise ValueError("name is required")
+        if not audio_files:
+            raise ValueError("audio_files is required")
+
+        files: list[tuple[str, bytes, str]] = []
+        for index, audio_file in enumerate(audio_files, start=1):
+            audio_name, audio_bytes = _read_audio_source(audio_file)
+            safe_name = audio_name or f"sample_{index}.wav"
+            files.append((safe_name, audio_bytes, _guess_mime_type(safe_name)))
+
+        fields: Dict[str, Any] = {
+            "name": name,
+            "remove_background_noise": remove_background_noise,
+        }
+        if description:
+            fields["description"] = description
+        if labels:
+            fields["labels"] = dict(labels)
+
+        response = self._request(
+            "POST",
+            "/v1/voices/add",
+            multipart_fields=fields,
+            multipart_files={"files[]": files},
+            accept_json=True,
+            timeout=timeout,
+        )
+        if isinstance(response.body, dict):
+            return response.body
+        raise ElevenLabsError("voice cloning did not return JSON")
 
     def synthesize_speech(
         self,

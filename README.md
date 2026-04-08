@@ -16,7 +16,7 @@ Source Video
   ├─ 3. Transcript Review ──── CSV checkpoint — correct text and speaker labels
   ├─ 4. Translation ────────── OpenRouter translation model with timing hints
   ├─ 5. Translation Review ─── CSV checkpoint — verify meaning and timing fit
-  ├─ 6. Voice Prep ─────────── Speaker sample packs + voice_id mapping
+  ├─ 6. Voice Prep ─────────── Automatic per-speaker sample aggregation + ElevenLabs instant voice cloning
   ├─ 7. Synthesis ──────────── ElevenLabs TTS per approved segment
   ├─ 8. Alignment ──────────── Time-stretch to match original timing windows
   └─ 9. Final Mix ──────────── English voice + instrumental → output.mp4
@@ -35,7 +35,7 @@ Source Video
 | **Demucs** *(optional)* | Auto-detected for source separation if installed |
 | **Custom separation backend** *(optional)* | Supported via `source_separation_command` if you do not use Demucs |
 | **Rubber Band** *(optional)* | Higher-quality time-stretching; otherwise FFmpeg `atempo` is used |
-| **ElevenLabs API key** | Required for transcription and synthesis |
+| **ElevenLabs API key** | Required for transcription, automatic voice cloning, and synthesis |
 | **OpenRouter API key** | Required for translation; default model is `minimax/minimax-m2.5:free` |
 | **Source video** | Always required because the final stage remuxes audio back into the original video |
 
@@ -73,11 +73,20 @@ Review the Russian transcript, fix text and speaker labels as needed, and mark e
 
 Review the English draft for accuracy, phrasing, and timing fit. Rows with `overflow=true` need to be shortened or rephrased before approval. When all rows are approved, rerun the wizard to continue.
 
-### 3. Voice Prep and Speaker Mapping
+### 3. Voice Prep and Automatic Voice Cloning
 **`{job}/04_voice_prep/speaker_samples/`**
 **`{job}/04_voice_prep/voice_prep_manifest.json`**
 
-The pipeline extracts sample clips for each detected speaker, but it does **not** create voices automatically. Create or choose voices outside this repository, then rerun the wizard and enter each speaker’s ElevenLabs `voice_id` when prompted.
+The pipeline now automatically prepares per-speaker clone audio from the separated vocals stem. For each detected speaker it:
+
+1. Selects diarized transcript segments that appear to contain a persistent single speaker
+2. Trims those ranges from the vocals stem
+3. Keeps only non-silent spans
+4. Merges multiple spans together until the configured cloning duration is reached
+5. Normalizes the merged sample audio
+6. Creates an ElevenLabs instant voice clone automatically when auto-cloning is enabled
+
+Default clone duration settings are 60 seconds minimum, 120 seconds target, and 300 seconds maximum. If a speaker does not have enough clean material, automatic cloning is disabled, or ElevenLabs rejects the clone, the stage stops for review. Inspect `voice_prep_manifest.json`, create or assign a `voice_id` manually if needed, then rerun.
 
 ### 4. Alignment Overflow
 **`{job}/05_alignment/alignment_issues.json`**
@@ -128,6 +137,10 @@ tests/
     │   └── translation_segments_approved.json
     ├── 04_voice_prep/
     │   ├── speaker_samples/
+    │   │   └── {speaker}/
+    │   │       ├── raw_segments/
+    │   │       ├── clone_source.wav
+    │   │       └── clone_source_normalized.wav
     │   └── voice_prep_manifest.json
     ├── 04_synthesis/
     │   └── synthesis_manifest.json
@@ -177,9 +190,33 @@ Translation is performed through OpenRouter chat completions. The default model 
 
 The workflow is designed for Russian-to-English dubbing. The wizard stores source and target language codes, but the current translation prompt is English-oriented in practice.
 
-### Voice Mapping
+### Voice Mapping and Automatic Cloning
 
-Voice prep extracts up to five sample clips per speaker into `04_voice_prep/speaker_samples/`. Those samples are for external voice selection or cloning workflows. Once you have ElevenLabs `voice_id` values, rerun the wizard and enter them so synthesis can proceed.
+Voice prep no longer stops at raw speaker sample extraction alone. It now builds clone-ready sample audio per speaker from the vocals stem, using diarized transcript timing plus silence detection to merge only usable speech spans.
+
+When `auto_clone_voices` is enabled, the pipeline sends the normalized merged sample to ElevenLabs instant voice cloning and stores the returned `voice_id` in `speaker_voice_map` automatically. Existing speaker mappings are reused as-is, so reruns do not reclone speakers that already have a mapped voice.
+
+Clone preparation is controlled by these settings:
+
+- `voice_clone_prefix`
+- `voice_clone_min_seconds`
+- `voice_clone_target_seconds`
+- `voice_clone_max_seconds`
+- `voice_clone_remove_background_noise`
+
+If automatic cloning cannot complete for a speaker, `04_voice_prep/voice_prep_manifest.json` records the status for that speaker, including cases such as `insufficient_audio`, `clone_ready_manual_voice_id_needed`, or `clone_failed`.
+
+### Non-Interactive Voice Cloning Flags
+
+For non-interactive runs, the CLI supports:
+
+- `--disable-auto-clone-voices`
+- `--voice-clone-prefix`
+- `--voice-clone-min-seconds`
+- `--voice-clone-target-seconds`
+- `--voice-clone-max-seconds`
+- `--voice-clone-remove-background-noise`
+- `--voice-id` to force one voice for every speaker when desired
 
 ---
 
@@ -225,7 +262,7 @@ Columns:
 Run the unit test suite with:
 
 ```bash
-python3 -m unittest
+python3 -m unittest discover -s tests
 ```
 
 The repository currently includes tests for stage behavior, manifest persistence, and review CSV round-tripping.
@@ -236,5 +273,6 @@ The repository currently includes tests for stage behavior, manifest persistence
 
 - Core HTTP/API calls use `urllib` from the Python standard library
 - Timing behavior is configurable through settings such as syllables-per-second, max stretch ratio, segment gap threshold, and segment duration limits
+- Voice prep can automatically clone each detected speaker from merged clean sample audio, but manual intervention is still possible when clone creation needs review
 - External tools and APIs are wrapped with explicit error messages intended to make reruns and recovery easier
 

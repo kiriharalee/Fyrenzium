@@ -135,6 +135,12 @@ class PipelineSettings:
     auto_approve_transcript_review: bool = False
     auto_approve_translation_review: bool = False
     auto_voice_id: str = ""
+    auto_clone_voices: bool = True
+    voice_clone_prefix: str = "fyrenzium"
+    voice_clone_min_seconds: float = 60.0
+    voice_clone_target_seconds: float = 120.0
+    voice_clone_max_seconds: float = 300.0
+    voice_clone_remove_background_noise: bool = False
     allow_alignment_overflow: bool = False
     estimated_speakers: Optional[int] = None
     syllables_per_second: float = 4.5

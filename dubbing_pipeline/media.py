@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -217,6 +218,125 @@ def concatenate_audio(inputs: Sequence[Path], output_audio: Path) -> Path:
     command.extend(["-filter_complex", filter_complex, "-map", "[out]", "-c:a", "pcm_s16le", str(output_audio)])
     run_command(command)
     return output_audio
+
+
+def merge_audio_segments(
+    input_audio: Path,
+    segments: Sequence[Tuple[float, float]],
+    output_audio: Path,
+) -> Path:
+    cleaned_segments: List[Tuple[float, float]] = []
+    for start_seconds, end_seconds in segments:
+        start = max(0.0, float(start_seconds))
+        end = max(start, float(end_seconds))
+        if end - start < 0.05:
+            continue
+        if cleaned_segments and start <= cleaned_segments[-1][1] + 0.02:
+            previous_start, previous_end = cleaned_segments[-1]
+            cleaned_segments[-1] = (previous_start, max(previous_end, end))
+            continue
+        cleaned_segments.append((start, end))
+    if not cleaned_segments:
+        raise MediaToolError("merge_audio_segments requires at least one non-empty segment.")
+
+    ffmpeg = require_executable("ffmpeg", "Install FFmpeg to merge audio segments.")
+    ensure_parent_dir(output_audio)
+    filter_parts = []
+    concat_inputs = []
+    for index, (start, end) in enumerate(cleaned_segments):
+        duration = end - start
+        filter_parts.append(
+            f"[0:a]atrim=start={start:.6f}:duration={duration:.6f},asetpts=PTS-STARTPTS[s{index}]"
+        )
+        concat_inputs.append(f"[s{index}]")
+    filter_complex = ";".join(filter_parts + ["".join(concat_inputs) + f"concat=n={len(cleaned_segments)}:v=0:a=1[out]"])
+    run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_audio),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-c:a",
+            "pcm_s16le",
+            str(output_audio),
+        ]
+    )
+    return output_audio
+
+
+def detect_nonsilent_spans(
+    input_audio: Path,
+    *,
+    noise_db: float = -35.0,
+    minimum_silence_seconds: float = 0.35,
+) -> List[Tuple[float, float]]:
+    ffmpeg = require_executable("ffmpeg", "Install FFmpeg to analyze silence.")
+    result = run_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-i",
+            str(input_audio),
+            "-af",
+            f"silencedetect=noise={noise_db}dB:d={minimum_silence_seconds}",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    log_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    spans: List[Tuple[float, float]] = []
+    current_start = 0.0
+    for line in log_output.splitlines():
+        start_match = re.search(r"silence_start:\s*([0-9.]+)", line)
+        if start_match:
+            silence_start = float(start_match.group(1))
+            if silence_start > current_start:
+                spans.append((current_start, silence_start))
+            continue
+        end_match = re.search(r"silence_end:\s*([0-9.]+)", line)
+        if end_match:
+            current_start = float(end_match.group(1))
+    total_duration = ffprobe_duration_seconds(input_audio)
+    if total_duration > current_start:
+        spans.append((current_start, total_duration))
+    return [(start, end) for start, end in spans if end - start >= 0.05]
+
+
+def rms_level_db(
+    input_audio: Path,
+) -> Optional[float]:
+    ffmpeg = require_executable("ffmpeg", "Install FFmpeg to analyze audio loudness.")
+    result = run_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-i",
+            str(input_audio),
+            "-af",
+            "astats=metadata=1:reset=0",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    log_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    matches = re.findall(r"RMS level dB:\s*(-?[0-9.]+)", log_output)
+    if not matches:
+        return None
+    return float(matches[-1])
+
+
+def wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as handle:
+        frame_rate = handle.getframerate()
+        if frame_rate <= 0:
+            raise MediaToolError(f"Unsupported frame rate for {path}.")
+        return handle.getnframes() / float(frame_rate)
 
 
 def pad_audio_with_silence(

@@ -14,12 +14,14 @@ import wave
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Tuple
 
 from .media import (
     MediaToolError,
+    detect_nonsilent_spans,
     extract_audio_from_video,
     ffprobe_duration_seconds,
+    merge_audio_segments,
     mix_audio_tracks,
     mix_voice_and_instrumental,
     mux_audio_into_video,
@@ -30,6 +32,7 @@ from .media import (
     stretch_audio_ffmpeg,
     stretch_audio_rubberband,
     trim_audio_segment,
+    rms_level_db,
     which,
 )
 from .models import StageName, StageStatus, TranscriptSegment, TranscriptWord, TranslationSegment
@@ -1024,6 +1027,142 @@ class TranslationReviewStage(PipelineStage):
 
 class VoicePrepStage(PipelineStage):
     stage_name = StageName.VOICE_PREP
+    minimum_segment_seconds = 1.5
+    boundary_padding_seconds = 0.12
+    minimum_nonsilent_seconds = 0.5
+
+    def _speaker_groups(self, segments: Sequence[TranscriptSegment]) -> Dict[str, List[TranscriptSegment]]:
+        grouped: Dict[str, List[TranscriptSegment]] = {}
+        for segment in segments:
+            grouped.setdefault(segment.speaker, []).append(segment)
+        return grouped
+
+    def _candidate_intervals(
+        self,
+        speaker_segments: Sequence[TranscriptSegment],
+        *,
+        low_confidence_threshold: float,
+    ) -> List[Dict[str, Any]]:
+        preferred: List[Dict[str, Any]] = []
+        fallback: List[Dict[str, Any]] = []
+        for segment in speaker_segments:
+            original_duration = max(0.0, segment.end_sec - segment.start_sec)
+            if original_duration < 0.5:
+                continue
+            start_sec = segment.start_sec + self.boundary_padding_seconds
+            end_sec = segment.end_sec - self.boundary_padding_seconds
+            if end_sec - start_sec < 0.5:
+                start_sec = segment.start_sec
+                end_sec = segment.end_sec
+            interval = {
+                "segment_id": segment.segment_id,
+                "speaker": segment.speaker,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "duration_sec": max(0.0, end_sec - start_sec),
+                "confidence": segment.confidence,
+                "text": segment.text,
+            }
+            speakers = {word.speaker or segment.speaker for word in segment.words} if segment.words else {segment.speaker}
+            is_clean = (
+                interval["duration_sec"] >= self.minimum_segment_seconds
+                and len(speakers) == 1
+                and (segment.confidence is None or segment.confidence >= low_confidence_threshold)
+            )
+            if is_clean:
+                preferred.append(interval)
+            else:
+                fallback.append(interval)
+        chosen = preferred if preferred else fallback
+        return sorted(chosen, key=lambda item: item["duration_sec"], reverse=True)
+
+    def _build_clone_audio(
+        self,
+        *,
+        vocals_path: Path,
+        speaker: str,
+        candidates: Sequence[Dict[str, Any]],
+        speaker_dir: Path,
+        min_seconds: float,
+        target_seconds: float,
+        max_seconds: float,
+    ) -> Dict[str, Any]:
+        raw_dir = speaker_dir / "raw_segments"
+        selected_chunks: List[Dict[str, Any]] = []
+        combined_seconds = 0.0
+        for candidate in candidates:
+            if combined_seconds >= target_seconds and combined_seconds >= min_seconds:
+                break
+            raw_path = raw_dir / f"{candidate['segment_id']}.wav"
+            trim_audio_segment(
+                vocals_path,
+                raw_path,
+                start_seconds=float(candidate["start_sec"]),
+                duration_seconds=max(0.1, float(candidate["duration_sec"])),
+            )
+            nonsilent = detect_nonsilent_spans(raw_path)
+            relative_spans = nonsilent or [(0.0, float(candidate["duration_sec"]))]
+            for rel_start, rel_end in relative_spans:
+                duration = max(0.0, rel_end - rel_start)
+                if duration < self.minimum_nonsilent_seconds:
+                    continue
+                remaining = max_seconds - combined_seconds
+                if remaining <= 0:
+                    break
+                if duration > remaining:
+                    rel_end = rel_start + remaining
+                    duration = remaining
+                selected_chunks.append(
+                    {
+                        "segment_id": candidate["segment_id"],
+                        "speaker": speaker,
+                        "start_sec": float(candidate["start_sec"]) + rel_start,
+                        "end_sec": float(candidate["start_sec"]) + rel_end,
+                        "duration_sec": duration,
+                        "raw_sample_path": str(raw_path),
+                        "text": candidate.get("text", ""),
+                    }
+                )
+                combined_seconds += duration
+                if combined_seconds >= target_seconds and combined_seconds >= min_seconds:
+                    break
+            if combined_seconds >= max_seconds:
+                break
+
+        if combined_seconds < min_seconds:
+            return {
+                "speaker": speaker,
+                "status": "insufficient_audio",
+                "selected_chunks": selected_chunks,
+                "combined_duration_sec": round(combined_seconds, 3),
+                "message": (
+                    f"Only found {combined_seconds:.1f}s of usable single-speaker audio for {speaker}; "
+                    f"need at least {min_seconds:.1f}s for automatic cloning."
+                ),
+            }
+
+        selected_chunks = sorted(selected_chunks, key=lambda item: (item["start_sec"], item["end_sec"]))
+        merge_intervals = [(float(item["start_sec"]), float(item["end_sec"])) for item in selected_chunks]
+        merged_path = speaker_dir / "clone_source.wav"
+        normalized_path = speaker_dir / "clone_source_normalized.wav"
+        merge_audio_segments(vocals_path, merge_intervals, merged_path)
+        normalize_audio(merged_path, normalized_path, target_i="-20", target_tp="-3")
+        normalized_duration = ffprobe_duration_seconds(normalized_path)
+        return {
+            "speaker": speaker,
+            "status": "ready",
+            "selected_chunks": selected_chunks,
+            "combined_duration_sec": round(normalized_duration, 3),
+            "merged_sample_path": str(merged_path),
+            "clone_sample_path": str(normalized_path),
+            "rms_db": rms_level_db(normalized_path),
+        }
+
+    def _clone_name(self, context: "PipelineContext", speaker: str) -> str:
+        prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", context.settings.voice_clone_prefix).strip("-") or "fyrenzium"
+        job_name = re.sub(r"[^A-Za-z0-9_-]+", "-", context.manifest.job_name).strip("-") or "job"
+        speaker_name = re.sub(r"[^A-Za-z0-9_-]+", "-", speaker).strip("-") or "speaker"
+        return f"{prefix}-{job_name}-{speaker_name}"[:120]
 
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
@@ -1039,43 +1178,109 @@ class VoicePrepStage(PipelineStage):
             for segment in segments:
                 context.settings.speaker_voice_map.setdefault(segment.speaker, context.settings.auto_voice_id)
             context.save()
+
         sample_dir = stage_dir / "speaker_samples"
         manifest_entries: List[Dict[str, Any]] = []
-        speakers_seen: Dict[str, int] = {}
-        for segment in segments:
-            count = speakers_seen.get(segment.speaker, 0)
-            if count >= 5:
+        speaker_groups = self._speaker_groups(segments)
+        missing_speakers: List[str] = []
+        api_key = context.api_keys.get("elevenlabs")
+        client = ElevenLabsClient(api_key, default_model_id=context.settings.elevenlabs_tts_model) if api_key else None
+
+        min_seconds = max(1.0, context.settings.voice_clone_min_seconds)
+        target_seconds = max(min_seconds, context.settings.voice_clone_target_seconds)
+        max_seconds = max(target_seconds, context.settings.voice_clone_max_seconds)
+
+        for speaker, speaker_segments in sorted(speaker_groups.items()):
+            existing_voice_id = context.settings.speaker_voice_map.get(speaker, "").strip()
+            speaker_dir = sample_dir / speaker
+            if existing_voice_id:
+                manifest_entries.append(
+                    {
+                        "speaker": speaker,
+                        "status": "reused_existing_voice",
+                        "voice_id": existing_voice_id,
+                        "segment_count": len(speaker_segments),
+                    }
+                )
                 continue
-            speakers_seen[segment.speaker] = count + 1
-            output_path = sample_dir / segment.speaker / f"{segment.segment_id}.wav"
-            trim_audio_segment(
-                vocals_path,
-                output_path,
-                start_seconds=segment.start_sec,
-                duration_seconds=max(0.1, segment.end_sec - segment.start_sec),
+
+            candidates = self._candidate_intervals(
+                speaker_segments,
+                low_confidence_threshold=context.settings.low_confidence_threshold,
             )
-            manifest_entries.append(
+            build_result = self._build_clone_audio(
+                vocals_path=vocals_path,
+                speaker=speaker,
+                candidates=candidates,
+                speaker_dir=speaker_dir,
+                min_seconds=min_seconds,
+                target_seconds=target_seconds,
+                max_seconds=max_seconds,
+            )
+            build_result["candidate_count"] = len(candidates)
+            build_result["segment_count"] = len(speaker_segments)
+
+            if build_result["status"] != "ready":
+                manifest_entries.append(build_result)
+                missing_speakers.append(speaker)
+                continue
+
+            if not context.settings.auto_clone_voices:
+                build_result["status"] = "clone_ready_manual_voice_id_needed"
+                manifest_entries.append(build_result)
+                missing_speakers.append(speaker)
+                continue
+
+            if client is None:
+                raise MediaToolError("Missing ElevenLabs API key.")
+
+            clone_name = self._clone_name(context, speaker)
+            try:
+                clone_response = client.create_voice_clone(
+                    name=clone_name,
+                    audio_files=[Path(build_result["clone_sample_path"])],
+                    description=(
+                        f"Auto-created clone for {speaker} in project {context.manifest.job_name}."
+                    ),
+                    labels={
+                        "source_language": context.settings.source_language,
+                        "target_language": context.settings.target_language,
+                        "speaker": speaker,
+                    },
+                    remove_background_noise=context.settings.voice_clone_remove_background_noise,
+                )
+            except ElevenLabsError as exc:
+                build_result["status"] = "clone_failed"
+                build_result["message"] = str(exc)
+                manifest_entries.append(build_result)
+                missing_speakers.append(speaker)
+                continue
+
+            voice_id = str(clone_response.get("voice_id") or "").strip()
+            if not voice_id:
+                build_result["status"] = "clone_failed"
+                build_result["message"] = "ElevenLabs did not return a voice_id for the created clone."
+                manifest_entries.append(build_result)
+                missing_speakers.append(speaker)
+                continue
+
+            context.settings.speaker_voice_map[speaker] = voice_id
+            build_result.update(
                 {
-                    "speaker": segment.speaker,
-                    "sample_path": str(output_path),
-                    "segment_id": segment.segment_id,
-                    "voice_id": context.settings.speaker_voice_map.get(segment.speaker, ""),
+                    "status": "cloned",
+                    "voice_id": voice_id,
+                    "clone_name": clone_name,
+                    "requires_verification": bool(clone_response.get("requires_verification", False)),
                 }
             )
+            manifest_entries.append(build_result)
 
+        context.save()
         prep_manifest = stage_dir / "voice_prep_manifest.json"
         write_json(prep_manifest, manifest_entries)
-        missing_speakers = sorted(
-            {
-                entry["speaker"]
-                for entry in manifest_entries
-                if not entry.get("voice_id")
-            }
-        )
         if missing_speakers:
             message = (
-                "Voice sample packs are ready. Create PVCs externally, then rerun and add voice IDs for: "
-                + ", ".join(missing_speakers)
+                "Automatic voice cloning needs attention for: " + ", ".join(sorted(set(missing_speakers)))
             )
             return StageResult(
                 self.stage_name,

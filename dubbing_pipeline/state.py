@@ -148,6 +148,14 @@ def from_json_dict(data: Dict[str, Any]) -> JobManifest:
         auto_approve_transcript_review=bool(settings_data.get("auto_approve_transcript_review", False)),
         auto_approve_translation_review=bool(settings_data.get("auto_approve_translation_review", False)),
         auto_voice_id=settings_data.get("auto_voice_id", ""),
+        auto_clone_voices=bool(settings_data.get("auto_clone_voices", True)),
+        voice_clone_prefix=settings_data.get("voice_clone_prefix", "fyrenzium"),
+        voice_clone_min_seconds=float(settings_data.get("voice_clone_min_seconds", 60.0)),
+        voice_clone_target_seconds=float(settings_data.get("voice_clone_target_seconds", 120.0)),
+        voice_clone_max_seconds=float(settings_data.get("voice_clone_max_seconds", 300.0)),
+        voice_clone_remove_background_noise=bool(
+            settings_data.get("voice_clone_remove_background_noise", False)
+        ),
         allow_alignment_overflow=bool(settings_data.get("allow_alignment_overflow", False)),
         estimated_speakers=settings_data.get("estimated_speakers"),
         syllables_per_second=float(settings_data.get("syllables_per_second", 4.5)),
