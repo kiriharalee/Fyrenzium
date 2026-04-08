@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 DEFAULT_OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.6-plus-preview:free"
+DEFAULT_OPENROUTER_MODEL = "minimax/minimax-m2.5:free"
 
 
 class OpenRouterError(RuntimeError):

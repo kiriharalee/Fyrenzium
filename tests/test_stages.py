@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from dubbing_pipeline.media import extract_audio_from_video
+from dubbing_pipeline.media import MediaToolError, extract_audio_from_video
 from dubbing_pipeline.models import PipelineSettings, SourceMedia, StageName, StageStatus, TranscriptWord
 from dubbing_pipeline.pipeline import PipelineRunner, StageResult, build_context
 from dubbing_pipeline.stages import (
@@ -12,8 +12,11 @@ from dubbing_pipeline.stages import (
     PipelineStage,
     SourceSeparationStage,
     SynthesisStage,
+    TranscriptionStage,
+    TranscriptReviewStage,
     build_segments,
     estimate_syllables,
+    normalize_words_to_single_speaker,
     parse_translation_content,
 )
 from dubbing_pipeline.state import build_manifest, save_manifest, update_stage_status
@@ -36,6 +39,82 @@ class StageHelperTests(unittest.TestCase):
 
     def test_estimate_syllables_returns_positive_count(self) -> None:
         self.assertGreaterEqual(estimate_syllables("hello from fyrenzium"), 3)
+
+    def test_normalize_words_to_single_speaker_relabels_all_words(self) -> None:
+        words = [
+            TranscriptWord(word="Privet", start_sec=0.0, end_sec=0.3, speaker="speaker_a"),
+            TranscriptWord(word="mir", start_sec=0.31, end_sec=0.5, speaker="speaker_b"),
+        ]
+
+        normalized = normalize_words_to_single_speaker(words)
+
+        self.assertEqual([word.speaker for word in normalized], ["speaker_1", "speaker_1"])
+        self.assertEqual([word.word for word in normalized], ["Privet", "mir"])
+
+    def test_transcription_stage_uses_simple_mode_single_speaker_settings(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(simple_mode=True, estimated_speakers=1),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.SOURCE_SEPARATION,
+                StageStatus.COMPLETED,
+                "done",
+                {"vocals": str(job_dir / "01_source" / "vocals.wav")},
+            )
+            save_manifest(manifest)
+            vocals_path = job_dir / "01_source" / "vocals.wav"
+            vocals_path.parent.mkdir(parents=True, exist_ok=True)
+            vocals_path.write_bytes(b"fake-vocals")
+            context = build_context(job_dir, {"elevenlabs": "test-key"})
+
+            with patch("dubbing_pipeline.stages.ElevenLabsClient.transcribe_audio", return_value={"words": []}) as transcribe_mock:
+                result = TranscriptionStage().run(context)
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertEqual(transcribe_mock.call_args.kwargs["diarize"], False)
+        self.assertEqual(transcribe_mock.call_args.kwargs["num_speakers"], 1)
+
+    def test_transcript_review_stage_normalizes_speakers_in_simple_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(simple_mode=True),
+            )
+            raw_path = job_dir / "02_transcript" / "transcript_raw.json"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text(
+                '[{"word":"Privet","start":0.0,"end":0.3,"speaker":"speaker_a"},'
+                '{"word":"mir","start":0.31,"end":0.5,"speaker":"speaker_b"}]\n',
+                encoding="utf-8",
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.TRANSCRIPTION,
+                StageStatus.COMPLETED,
+                "done",
+                {"transcript_raw": str(raw_path)},
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {})
+
+            result = TranscriptReviewStage().run(context)
+
+            review_csv_path = Path(result.artifacts["transcript_review_csv"])
+            review_csv = review_csv_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.status.value, "needs_review")
+        self.assertIn("speaker_1", review_csv)
+        self.assertNotIn("speaker_a", review_csv)
+        self.assertNotIn("speaker_b", review_csv)
 
     def test_source_separation_reuses_existing_input_audio(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -114,6 +193,39 @@ class StageHelperTests(unittest.TestCase):
         self.assertIn("/usr/bin/demucs --two-stems vocals", result.artifacts["source_separation_command"])
         self.assertTrue(result.artifacts["source_separation_raw_output_dir"].endswith("/01_source/demucs_output"))
         self.assertIn("vocals_stream_info", result.artifacts)
+
+    def test_source_separation_demucs_backend_error_needs_review(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            source_audio = Path(temp_dir) / "source.wav"
+            source_audio.write_bytes(b"input-audio")
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4"), audio_path=source_audio),
+                PipelineSettings(),
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {})
+
+            error = MediaToolError(
+                "Command failed with exit code 1: /usr/bin/demucs --two-stems vocals "
+                "-o /tmp/out /tmp/input.wav\n"
+                "RuntimeError: Couldn't find appropriate backend to handle uri "
+                "/tmp/out/vocals.wav and format None.\n"
+                "torchaudio backend unavailable"
+            )
+
+            with patch("dubbing_pipeline.stages.which", return_value="/usr/bin/demucs"), patch(
+                "dubbing_pipeline.stages.run_command", side_effect=error
+            ):
+                result = SourceSeparationStage().run(context)
+
+        self.assertEqual(result.status, StageStatus.NEEDS_REVIEW)
+        self.assertEqual(result.artifacts["input_audio"], str(job_dir / "01_source" / "input_audio.wav"))
+        self.assertIn("Demucs was detected", result.message)
+        self.assertIn("source_separation_command", result.message)
+        self.assertIn("/usr/bin/demucs --two-stems vocals", result.message)
 
     def test_source_separation_rejects_identical_vocals_output(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -259,6 +371,81 @@ class StageHelperTests(unittest.TestCase):
             item for item in final_manifest.stage_records if item.name == StageName.SOURCE_SEPARATION
         )
         self.assertEqual(source_record.status, StageStatus.NEEDS_REVIEW)
+
+    def test_pipeline_marks_media_tool_error_as_failed(self) -> None:
+        class FailingStage(PipelineStage):
+            stage_name = StageName.SOURCE_SEPARATION
+
+            def run(self, context) -> StageResult:
+                raise MediaToolError("ffmpeg failed")
+
+        class FollowupStage(PipelineStage):
+            stage_name = StageName.TRANSCRIPTION
+
+            def __init__(self) -> None:
+                self.run_calls = 0
+
+            def run(self, context) -> StageResult:
+                self.run_calls += 1
+                return StageResult(self.stage_name, StageStatus.COMPLETED)
+
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(),
+            )
+            save_manifest(manifest)
+            followup_stage = FollowupStage()
+            runner = PipelineRunner(build_context(job_dir, {}), [FailingStage(), followup_stage])
+
+            final_manifest = runner.run(resume=True)
+
+        source_record = next(
+            item for item in final_manifest.stage_records if item.name == StageName.SOURCE_SEPARATION
+        )
+        self.assertEqual(source_record.status, StageStatus.FAILED)
+        self.assertEqual(source_record.message, "ffmpeg failed")
+        self.assertEqual(followup_stage.run_calls, 0)
+
+    def test_pipeline_persists_demucs_backend_error_as_needs_review(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            source_audio = Path(temp_dir) / "source.wav"
+            source_audio.write_bytes(b"input-audio")
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4"), audio_path=source_audio),
+                PipelineSettings(),
+            )
+            save_manifest(manifest)
+
+            error = MediaToolError(
+                "Command failed with exit code 1: /usr/bin/demucs --two-stems vocals "
+                "-o /tmp/out /tmp/input.wav\n"
+                "RuntimeError: Couldn't find appropriate backend to handle uri "
+                "/tmp/out/vocals.wav and format None."
+            )
+
+            with patch("dubbing_pipeline.stages.which", return_value="/usr/bin/demucs"), patch(
+                "dubbing_pipeline.stages.run_command", side_effect=error
+            ):
+                runner = PipelineRunner(build_context(job_dir, {}), [SourceSeparationStage()])
+                final_manifest = runner.run(resume=True)
+
+        source_record = next(
+            item for item in final_manifest.stage_records if item.name == StageName.SOURCE_SEPARATION
+        )
+        self.assertEqual(source_record.status, StageStatus.NEEDS_REVIEW)
+        self.assertNotEqual(source_record.status, StageStatus.IN_PROGRESS)
+        self.assertEqual(
+            source_record.artifacts["input_audio"],
+            str(job_dir / "01_source" / "input_audio.wav"),
+        )
+        self.assertIn("Demucs was detected", source_record.message)
 
     def test_extract_audio_from_video_preserves_stereo_by_default(self) -> None:
         with patch("dubbing_pipeline.media.require_executable", return_value="ffmpeg"), patch(

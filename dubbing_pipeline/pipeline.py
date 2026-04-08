@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+from .media import MediaToolError
 from .models import JobManifest, StageName, StageStatus
 from .state import load_manifest, save_manifest, stage_lookup, update_stage_status
 
@@ -114,7 +115,18 @@ class PipelineRunner:
             )
             self.context.save()
 
-            result = stage.run(self.context)
+            try:
+                result = stage.run(self.context)
+            except MediaToolError as exc:
+                self.context.manifest = update_stage_status(
+                    self.context.manifest,
+                    stage.stage_name,
+                    StageStatus.FAILED,
+                    str(exc),
+                    self.context.stage_artifacts(stage.stage_name),
+                )
+                self.context.save()
+                break
             self.context.set_stage_result(result)
 
             if result.status in {StageStatus.NEEDS_REVIEW, StageStatus.FAILED}:

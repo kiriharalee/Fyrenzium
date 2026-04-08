@@ -127,20 +127,20 @@ def choose_existing_job_dir() -> Path:
         print("Select a valid job number.")
 
 
-def collect_source_media() -> SourceMedia:
+def collect_source_media(source_language: str) -> SourceMedia:
     print("\nSource media")
     video_path = prompt_path("Source video path", must_exist=True)
     audio_path = None
     if prompt_yes_no("Do you already have a separate source audio file?", default=False):
         audio_path = prompt_path("Source audio path", must_exist=True)
-    language = prompt_text("Source spoken language code", "ru")
     title = prompt_text("Project title", video_path.stem)
-    return SourceMedia(video_path=video_path, audio_path=audio_path, language=language, title=title)
+    return SourceMedia(video_path=video_path, audio_path=audio_path, language=source_language, title=title)
 
 
 def collect_pipeline_settings() -> PipelineSettings:
     print("\nPipeline settings")
     return PipelineSettings(
+        simple_mode=False,
         source_language=prompt_text("Source language code", "ru"),
         target_language=prompt_text("Target language code", "en"),
         source_separation_runner="auto",
@@ -150,7 +150,7 @@ def collect_pipeline_settings() -> PipelineSettings:
         elevenlabs_tts_model=prompt_text("ElevenLabs TTS model", "eleven_multilingual_v2"),
         openrouter_api_key_env=prompt_text("OpenRouter API key environment variable", "OPENROUTER_API_KEY"),
         translation_model=prompt_text(
-            "OpenRouter translation model", "qwen/qwen3.6-plus-preview:free"
+            "OpenRouter translation model", "minimax/minimax-m2.5:free"
         ),
         scribe_keyterms=prompt_csv("Scribe keyterms (comma separated)", []),
         translation_glossary=prompt_csv("Translation glossary terms (comma separated)", []),
@@ -163,10 +163,38 @@ def collect_pipeline_settings() -> PipelineSettings:
     )
 
 
+def collect_simple_pipeline_settings() -> PipelineSettings:
+    print("\nSimple test mode")
+    print("Basic functionality check with one suggested speaker and fewer settings.")
+    return PipelineSettings(
+        simple_mode=True,
+        source_language=prompt_text("Source language code", "ru"),
+        target_language=prompt_text("Target language code", "en"),
+        source_separation_runner="auto",
+        source_separation_command="",
+        elevenlabs_api_key_env=prompt_text("ElevenLabs API key environment variable", "ELEVENLABS_API_KEY"),
+        elevenlabs_scribe_model="scribe_v2",
+        elevenlabs_tts_model="eleven_multilingual_v2",
+        openrouter_api_key_env=prompt_text("OpenRouter API key environment variable", "OPENROUTER_API_KEY"),
+        translation_model="minimax/minimax-m2.5:free",
+        scribe_keyterms=[],
+        translation_glossary=[],
+        estimated_speakers=1,
+        syllables_per_second=4.5,
+        max_duration_stretch=0.15,
+        low_confidence_threshold=0.75,
+        segment_gap_seconds=0.8,
+        max_segment_seconds=8.0,
+    )
+
+
 def build_new_job_manifest() -> Path:
     job_dir = choose_new_job_dir()
-    source_media = collect_source_media()
-    settings = collect_pipeline_settings()
+    use_simple_mode = prompt_yes_no("Use simple test mode?", default=False)
+    mode_label = "Simple Test Mode" if use_simple_mode else "Full Mode"
+    print(f"\nSelected mode: {mode_label}")
+    settings = collect_simple_pipeline_settings() if use_simple_mode else collect_pipeline_settings()
+    source_media = collect_source_media(settings.source_language)
     manifest = build_manifest(job_dir.name, job_dir, source_media, settings)
     save_manifest(manifest)
     print(f"\nCreated manifest at {job_dir / 'manifest.json'}")

@@ -119,6 +119,7 @@ class TranslationSegment:
 class PipelineSettings:
     """User-configurable settings captured during the wizard."""
 
+    simple_mode: bool = False
     source_language: str = "ru"
     target_language: str = "en"
     source_separation_runner: str = "auto"
@@ -127,7 +128,7 @@ class PipelineSettings:
     elevenlabs_scribe_model: str = "scribe_v2"
     elevenlabs_tts_model: str = "eleven_multilingual_v2"
     openrouter_api_key_env: str = "OPENROUTER_API_KEY"
-    translation_model: str = "qwen/qwen3.6-plus-preview:free"
+    translation_model: str = "minimax/minimax-m2.5:free"
     scribe_keyterms: List[str] = field(default_factory=list)
     translation_glossary: List[str] = field(default_factory=list)
     speaker_voice_map: Dict[str, str] = field(default_factory=dict)

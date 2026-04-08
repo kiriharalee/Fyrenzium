@@ -130,6 +130,7 @@ def from_json_dict(data: Dict[str, Any]) -> JobManifest:
         title=source_media_data.get("title"),
     )
     settings = PipelineSettings(
+        simple_mode=bool(settings_data.get("simple_mode", False)),
         source_language=settings_data.get("source_language", "ru"),
         target_language=settings_data.get("target_language", "en"),
         source_separation_runner=settings_data.get("source_separation_runner", "auto"),
@@ -139,7 +140,7 @@ def from_json_dict(data: Dict[str, Any]) -> JobManifest:
         elevenlabs_tts_model=settings_data.get("elevenlabs_tts_model", "eleven_multilingual_v2"),
         openrouter_api_key_env=settings_data.get("openrouter_api_key_env", "OPENROUTER_API_KEY"),
         translation_model=settings_data.get(
-            "translation_model", "qwen/qwen3.6-plus-preview:free"
+            "translation_model", "minimax/minimax-m2.5:free"
         ),
         scribe_keyterms=list(settings_data.get("scribe_keyterms", [])),
         translation_glossary=list(settings_data.get("translation_glossary", [])),

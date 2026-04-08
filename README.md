@@ -1,25 +1,25 @@
 # Fyrenzium
 
-**Interactive, modular Python pipeline for Russian-to-English video dubbing.**
+**Interactive, resumable Python CLI pipeline for Russian-to-English video dubbing.**
 
-No external Python dependencies — just stdlib, your API keys, and FFmpeg.
+The repository’s own code uses Python stdlib only, while media-heavy stages rely on external tools and APIs such as FFmpeg, Demucs, Rubber Band, ElevenLabs, and OpenRouter.
 
 ---
 
 ## Pipeline at a Glance
 
-```
+```text
 Source Video
   │
-  ├─ 1. Source Separation ──── Demucs isolates vocals from instrumentals
-  ├─ 2. Transcription ──────── ElevenLabs Scribe v2 with speaker diarization
-  ├─ 3. Transcript Review ──── ✏️  CSV checkpoint — correct speakers & text
-  ├─ 4. Translation ─────────── OpenRouter (Qwen) with glossary & timing hints
-  ├─ 5. Translation Review ─── ✏️  CSV checkpoint — verify syllable fit & meaning
-  ├─ 6. Voice Prep ──────────── Speaker sample packs + ElevenLabs voice mapping
-  ├─ 7. Synthesis ──────────── ElevenLabs TTS per segment
-  ├─ 8. Alignment ──────────── Time-stretch to match original timing
-  └─ 9. Final Mix ──────────── Combine English voice + instrumental → output.mp4
+  ├─ 1. Source Separation ──── Demucs auto-detect or custom separation command
+  ├─ 2. Transcription ──────── ElevenLabs Scribe v2 with optional diarization
+  ├─ 3. Transcript Review ──── CSV checkpoint — correct text and speaker labels
+  ├─ 4. Translation ────────── OpenRouter translation model with timing hints
+  ├─ 5. Translation Review ─── CSV checkpoint — verify meaning and timing fit
+  ├─ 6. Voice Prep ─────────── Speaker sample packs + voice_id mapping
+  ├─ 7. Synthesis ──────────── ElevenLabs TTS per approved segment
+  ├─ 8. Alignment ──────────── Time-stretch to match original timing windows
+  └─ 9. Final Mix ──────────── English voice + instrumental → output.mp4
 ```
 
 > Lip sync is intentionally excluded.
@@ -30,80 +30,113 @@ Source Video
 
 | Requirement | Notes |
 |---|---|
-| **Python 3.9+** | No pip packages needed |
+| **Python 3.9+** | Core repo code uses stdlib only |
 | **FFmpeg** | Must be on `PATH` |
-| **Demucs** (or other backend) | Auto-detected for source separation |
-| **Rubber Band** *(optional)* | Higher-quality time-stretching; falls back to FFmpeg |
-| **ElevenLabs API key** | Transcription + synthesis |
-| **OpenRouter API key** | Translation (defaults to `qwen/qwen3.6-plus-preview:free`) |
+| **Demucs** *(optional)* | Auto-detected for source separation if installed |
+| **Custom separation backend** *(optional)* | Supported via `source_separation_command` if you do not use Demucs |
+| **Rubber Band** *(optional)* | Higher-quality time-stretching; otherwise FFmpeg `atempo` is used |
+| **ElevenLabs API key** | Required for transcription and synthesis |
+| **OpenRouter API key** | Required for translation; default model is `minimax/minimax-m2.5:free` |
+| **Source video** | Always required because the final stage remuxes audio back into the original video |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Set your API keys
 export ELEVENLABS_API_KEY="..."
 export OPENROUTER_API_KEY="..."
-
-# Launch the interactive wizard
 python3 dubbing_pipeline.py
 ```
 
 The wizard walks you through:
 
-1. **New job** — provide a source video, configure languages, glossary, and timing parameters
-2. **Stage execution** — the pipeline runs automatically, pausing at review checkpoints
-3. **Resume** — rerun the wizard at any time to pick up where you left off
+1. Choosing a jobs root and creating or resuming a job
+2. Optionally enabling **simple test mode**
+3. Providing a source video and, if needed, a separate source-audio file
+4. Running stages until the pipeline reaches a manual stop point
+5. Rerunning the wizard later to resume from the next pending stage
 
 ---
 
-## Review Checkpoints
+## Manual Intervention Points
 
-The pipeline pauses at two points for manual quality control:
+The pipeline is resumable, but several stages intentionally stop for review or operator input.
 
-### Transcript Review
+### 1. Transcript Review
 **`{job}/02_transcript_review/transcript_review.csv`**
 
-Review and correct the Russian transcription and speaker labels. Mark every row `approved=true`, then rerun the wizard.
+Review the Russian transcript, fix text and speaker labels as needed, and mark every row `approved=true`. When all rows are approved, rerun the wizard to continue.
 
-### Translation Review
+### 2. Translation Review
 **`{job}/03_translation/translation_review.csv`**
 
-Check English translations for accuracy, syllable count, and timing fit. Fix any overflow flagged rows, approve all, and resume.
+Review the English draft for accuracy, phrasing, and timing fit. Rows with `overflow=true` need to be shortened or rephrased before approval. When all rows are approved, rerun the wizard to continue.
+
+### 3. Voice Prep and Speaker Mapping
+**`{job}/04_voice_prep/speaker_samples/`**
+**`{job}/04_voice_prep/voice_prep_manifest.json`**
+
+The pipeline extracts sample clips for each detected speaker, but it does **not** create voices automatically. Create or choose voices outside this repository, then rerun the wizard and enter each speaker’s ElevenLabs `voice_id` when prompted.
+
+### 4. Alignment Overflow
+**`{job}/05_alignment/alignment_issues.json`**
+
+If a synthesized segment would need more stretching than the configured `max_stretch_ratio` allows, alignment stops and records the issue. Shorten the translation or adjust timing settings, then rerun.
+
+### 5. Source Separation Setup Problems
+If Demucs is not available, or a configured separation command fails, the pipeline stops with instructions. Install/fix Demucs or update `source_separation_command` and rerun.
 
 ---
 
 ## Project Layout
 
-```
+```text
 dubbing_pipeline.py              ← entry point
 dubbing_pipeline/
-├── cli.py                       ← interactive wizard & prompts
-├── pipeline.py                  ← pipeline runner & context
-├── stages.py                    ← all 9 stage implementations
-├── models.py                    ← data classes & enums
-├── state.py                     ← manifest persistence
+├── cli.py                       ← interactive wizard and prompts
 ├── media.py                     ← FFmpeg / Rubber Band wrappers
-├── review.py                    ← CSV checkpoint helpers
+├── models.py                    ← data classes and enums
+├── pipeline.py                  ← runtime context and sequential stage runner
+├── review.py                    ← CSV review schemas and parsing helpers
+├── stages.py                    ← all 9 pipeline stage implementations
+├── state.py                     ← manifest persistence and job discovery
 └── providers/
-    ├── elevenlabs.py            ← transcription & synthesis client
+    ├── elevenlabs.py            ← transcription and synthesis client
     └── openrouter.py            ← translation client
 tests/
+├── test_review.py
 ├── test_stages.py
-├── test_state.py
-└── test_review.py
-jobs/                            ← created at runtime
+└── test_state.py
+{jobs_root}/                     ← user-chosen root, not fixed to the repo
 └── {job_name}/
     ├── manifest.json
     ├── 01_source/
+    │   ├── input_audio.wav
+    │   ├── vocals.wav
+    │   └── instrumental.wav
+    ├── 02_transcript/
+    │   └── transcript_raw.json
     ├── 02_transcript_review/
+    │   ├── transcript_segments.json
+    │   ├── transcript_review.csv
+    │   └── transcript_segments_approved.json
     ├── 03_translation/
+    │   ├── translation_review.csv
+    │   └── translation_segments.json
+    ├── 03_translation_review/
+    │   └── translation_segments_approved.json
     ├── 04_voice_prep/
+    │   ├── speaker_samples/
+    │   └── voice_prep_manifest.json
     ├── 04_synthesis/
+    │   └── synthesis_manifest.json
     ├── 05_alignment/
+    │   ├── alignment_manifest.json
+    │   └── alignment_issues.json
     └── 06_mix/
-        └── output.mp4           ← final result
+        ├── final_manifest.json
+        └── output.mp4
 ```
 
 ---
@@ -112,25 +145,96 @@ jobs/                            ← created at runtime
 
 ### Job Persistence
 
-Every job is backed by a `manifest.json` that tracks source media, settings, stage status, timestamps, and artifact hashes. You can stop and resume at any point — the pipeline validates previous outputs (including SHA1 checksums) before reusing them.
+Every job is backed by a `manifest.json` that stores source media, settings, stage status, timestamps, messages, and artifact paths. You can stop and resume later; completed stages are skipped only when their outputs are still considered reusable.
 
-### Voice Mapping
+Resume validation is strongest for source separation, synthesis, alignment, and final mix. Earlier stages rely more on recorded status plus expected artifact files.
 
-After the voice prep stage, rerun the wizard and choose to update speaker-to-voice mappings. For each detected speaker, provide their ElevenLabs `voice_id`. These are saved in the manifest and used during synthesis.
+### Source Media Requirements
 
-### Translation Model
+The source video path is always required because the final stage remuxes the finished dub onto the original video stream.
 
-The default translation model is `qwen/qwen3.6-plus-preview:free` via OpenRouter. If the model is rate-limited or unavailable, the pipeline will prompt you to retry, switch models, or stop.
+If you provide a separate audio file, the pipeline copies it directly into `01_source/input_audio.wav` and uses it as the source audio for separation/transcription. It is not transcoded on ingest.
 
 ### Source Separation
 
-The pipeline auto-detects supported CLI backends (e.g. `demucs`). You can also provide a custom separation command in the manifest for advanced setups.
+If `source_separation_command` is not configured, the pipeline auto-detects **Demucs** only. Other backends are still possible, but they must be invoked through a custom command template.
+
+Available placeholders for a custom command are:
+
+- `{input_video}`
+- `{input_audio}`
+- `{output_dir}`
+- `{vocals_path}`
+- `{instrumental_path}`
+
+### Simple Test Mode
+
+Simple mode is intended for lightweight testing. It reduces the number of prompts, disables diarization, and forces a single-speaker workflow so the rest of the pipeline can be exercised more quickly.
+
+### Translation
+
+Translation is performed through OpenRouter chat completions. The default model is `minimax/minimax-m2.5:free`, and the pipeline can prompt you to retry, switch models, or stop if the current model is rate-limited or unavailable.
+
+The workflow is designed for Russian-to-English dubbing. The wizard stores source and target language codes, but the current translation prompt is English-oriented in practice.
+
+### Voice Mapping
+
+Voice prep extracts up to five sample clips per speaker into `04_voice_prep/speaker_samples/`. Those samples are for external voice selection or cloning workflows. Once you have ElevenLabs `voice_id` values, rerun the wizard and enter them so synthesis can proceed.
+
+---
+
+## Review CSV Schemas
+
+### Transcript Review CSV
+**`{job}/02_transcript_review/transcript_review.csv`**
+
+Columns:
+
+- `segment_id`
+- `speaker`
+- `start_sec`
+- `end_sec`
+- `text_ru_raw`
+- `text_ru_final`
+- `speaker_final`
+- `approved`
+- `notes`
+
+### Translation Review CSV
+**`{job}/03_translation/translation_review.csv`**
+
+Columns:
+
+- `segment_id`
+- `speaker`
+- `start_sec`
+- `end_sec`
+- `text_ru_final`
+- `text_en_draft`
+- `text_en_final`
+- `duration_sec`
+- `syllables_per_sec`
+- `overflow`
+- `approved`
+- `notes`
+
+---
+
+## Tests
+
+Run the unit test suite with:
+
+```bash
+python3 -m unittest
+```
+
+The repository currently includes tests for stage behavior, manifest persistence, and review CSV round-tripping.
 
 ---
 
 ## Notes
 
-- Zero external Python dependencies — all HTTP clients use `urllib` from stdlib
-- Multipart uploads, JSON parsing, and form data are handled inline
-- Configurable timing parameters: syllables/sec target, max stretch ratio, segment gap threshold, and more
-- Comprehensive error handling with clear messages and recovery hints
+- Core HTTP/API calls use `urllib` from the Python standard library
+- Timing behavior is configurable through settings such as syllables-per-second, max stretch ratio, segment gap threshold, and segment duration limits
+- External tools and APIs are wrapped with explicit error messages intended to make reruns and recovery easier
+

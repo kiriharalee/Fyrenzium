@@ -80,14 +80,17 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha1(encoded).hexdigest()
 
 
-def extract_words(payload: Mapping[str, Any]) -> List[TranscriptWord]:
-    candidates: Iterable[Any] = payload.get("words") or []
-    if not candidates:
-        for key in ("segments", "utterances"):
-            nested = payload.get(key)
-            if isinstance(nested, list):
-                candidates = nested
-                break
+def extract_words(payload: Mapping[str, Any] | Sequence[Any]) -> List[TranscriptWord]:
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        candidates: Iterable[Any] = payload
+    else:
+        candidates = payload.get("words") or []
+        if not candidates:
+            for key in ("segments", "utterances"):
+                nested = payload.get(key)
+                if isinstance(nested, list):
+                    candidates = nested
+                    break
 
     words: List[TranscriptWord] = []
     for item in candidates:
@@ -117,6 +120,21 @@ def extract_words(payload: Mapping[str, Any]) -> List[TranscriptWord]:
             )
         )
     return words
+
+
+def normalize_words_to_single_speaker(
+    words: Sequence[TranscriptWord], speaker_label: str = "speaker_1"
+) -> List[TranscriptWord]:
+    return [
+        TranscriptWord(
+            word=word.word,
+            start_sec=word.start_sec,
+            end_sec=word.end_sec,
+            confidence=word.confidence,
+            speaker=speaker_label,
+        )
+        for word in words
+    ]
 
 
 def build_segments(words: Sequence[TranscriptWord], gap_threshold: float, max_segment_sec: float) -> List[TranscriptSegment]:
@@ -254,6 +272,29 @@ class SourceSeparationStage(PipelineStage):
     stage_name = StageName.SOURCE_SEPARATION
     validation_version = "1"
     silence_threshold_dbfs = -80.0
+
+    def _is_demucs_backend_error(self, error: MediaToolError) -> bool:
+        message = str(error).lower()
+        return (
+            "couldn't find appropriate backend to handle uri" in message
+            or ("torchaudio" in message and "backend" in message)
+            or ("save_audio" in message and "torchaudio" in message)
+        )
+
+    def _demucs_backend_failure_message(
+        self,
+        *,
+        attempted_command: Sequence[str],
+        validation_prefix: str,
+    ) -> str:
+        attempted = " ".join(attempted_command)
+        return (
+            validation_prefix
+            + "Demucs was detected but could not write separated audio because its Python "
+            "audio backend is unavailable. Fix the Demucs/Torchaudio environment on this "
+            "machine or set source_separation_command to use a different backend, then rerun. "
+            f"Attempted command: {attempted}"
+        )
 
     def _source_artifact_payload(
         self,
@@ -475,9 +516,20 @@ class SourceSeparationStage(PipelineStage):
                     str(demucs_output),
                     str(input_audio),
                 ]
-                run_command(
-                    demucs_command
-                )
+                try:
+                    run_command(demucs_command)
+                except MediaToolError as exc:
+                    if self._is_demucs_backend_error(exc):
+                        return StageResult(
+                            self.stage_name,
+                            StageStatus.NEEDS_REVIEW,
+                            self._demucs_backend_failure_message(
+                                attempted_command=demucs_command,
+                                validation_prefix=validation_prefix,
+                            ),
+                            artifacts,
+                        )
+                    raise
                 located = _find_demucs_stems(demucs_output, input_audio)
                 if located:
                     _copy_stem(located["vocals"], vocals_path)
@@ -551,8 +603,8 @@ class TranscriptionStage(PipelineStage):
             vocals_path,
             model_id=context.settings.elevenlabs_scribe_model,
             language_code=context.settings.source_language,
-            diarize=True,
-            num_speakers=context.settings.estimated_speakers,
+            diarize=not context.settings.simple_mode,
+            num_speakers=1 if context.settings.simple_mode else context.settings.estimated_speakers,
             keyterms=context.settings.scribe_keyterms,
         )
         raw_path = context.stage_dir(self.stage_name) / "transcript_raw.json"
@@ -609,6 +661,8 @@ class TranscriptReviewStage(PipelineStage):
             raise MediaToolError("Missing raw transcript JSON.")
         payload = read_json(raw_path, default={}) or {}
         words = extract_words(payload)
+        if context.settings.simple_mode:
+            words = normalize_words_to_single_speaker(words)
         segments = build_segments(
             words,
             context.settings.segment_gap_seconds,

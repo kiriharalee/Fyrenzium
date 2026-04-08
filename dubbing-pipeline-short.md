@@ -1,111 +1,78 @@
-# AI Video Dubbing Pipeline: Russian → English
+# Fyrenzium Pipeline Summary
 
-**Updated March 2026 — All models verified as top-of-benchmark for their task.**
-
----
-
-## Stage 1 — Source Separation
-
-**Tool:** Mel-RoFormer (via UVR5)
-
-Extracts all human voices into one clean vocal track and everything else (music, SFX, ambience) into a separate instrumental track. Mel-RoFormer is the current leader for vocal isolation, outperforming Demucs by 2+ dB SDR on standard benchmarks.
-
-Run via UVR5 (GUI) or MVSEP. Input: full video audio. Output: `vocals.wav` + `instrumental.wav`.
+This file is a short, implementation-aligned overview of the current repository.
+For operational details, file locations, and workflow notes, use `README.md` as the primary reference.
 
 ---
 
-## Stage 2 — Transcription + Speaker Diarization
+## Stage Summary
 
-**Tool:** ElevenLabs Scribe v2 (batch mode)
+### 1. Source Separation
+- Auto-detects **Demucs** if available
+- Otherwise uses a custom `source_separation_command`
+- Produces `vocals.wav` and `instrumental.wav`
 
-Feed the isolated vocal track from Stage 1 into Scribe v2. A single API call returns a structured JSON with the full Russian transcript, word-level timestamps, speaker IDs, and confidence scores. Supports 90+ languages with the lowest WER on industry benchmarks.
+### 2. Transcription
+- Uses **ElevenLabs Scribe v2**
+- Accepts source language, optional diarization, estimated speaker count, and keyterms
+- Writes raw transcript JSON for later review
 
-Use **keyterm prompting** (up to 1,000 terms) to pre-load Russian names, places, and technical vocabulary for accurate recognition.
+### 3. Transcript Review
+- Creates `02_transcript_review/transcript_review.csv`
+- Lets you correct Russian text and speaker labels
+- Requires every row to be approved before continuing
 
----
+### 4. Translation
+- Uses an **OpenRouter-configured chat-completions model**
+- Default model: `minimax/minimax-m2.5:free`
+- Builds prompts with timing, neighboring context, and glossary hints
 
-## Stage 3 — Human Review of Transcription
+### 5. Translation Review
+- Uses `03_translation/translation_review.csv`
+- Flags rows that likely overflow the available timing window
+- Requires approval before synthesis can begin
 
-Fix proper nouns, verify speaker labels are consistent, and check that timestamps align with the audio. Prioritize low-confidence segments from the Scribe output.
+### 6. Voice Prep
+- Extracts per-speaker sample clips into `04_voice_prep/speaker_samples/`
+- Writes `voice_prep_manifest.json`
+- Expects voice creation or selection to happen outside this repository
 
----
+### 7. Synthesis
+- Uses **ElevenLabs TTS** for each approved segment
+- Requires a `voice_id` mapping for every speaker
+- Writes per-speaker segment audio plus `synthesis_manifest.json`
 
-## Stage 4 — Translation with Timing Awareness
+### 8. Alignment
+- Uses **Rubber Band** when available, otherwise FFmpeg `atempo`
+- Time-stretches synthesized segments to match original timing
+- Stops and records `alignment_issues.json` when stretch exceeds the configured limit
 
-**Tool:** Claude
-
-Translate segment by segment with a prompt that includes original timestamps and instructs Claude to match approximate syllable count / duration of the Russian. Preserve speaker labels. Russian is typically longer than English, which works in your favor.
-
----
-
-## Stage 5 — Translation Review
-
-Read each English line aloud against the original timing. If a line overflows its segment duration, rephrase shorter. Rule of thumb: ~4.5 syllables per second of available time.
-
----
-
-## Stage 6 — Voice Cloning + Speech Synthesis
-
-**Tool:** ElevenLabs Dubbing Studio
-
-Two approaches:
-
-- **Full upload:** Upload the original video and let Dubbing Studio handle separation, transcription, translation, voice cloning, and synthesis end-to-end. Review and tweak in the editor.
-- **Segment-by-segment API:** Extract 30–60s clean vocal samples per speaker from Stage 1, create Professional Voice Clones, then synthesize each translated segment individually for full control over speed/stability/similarity.
-
-For a 2-hour video, expect to need a Scale or Business plan.
-
----
-
-## Stage 7 — Timing Alignment
-
-**Tools:** FFmpeg (`atempo`) or Rubberband
-
-Time-stretch synthesized segments to fit original timing windows. Stay within ±15% — beyond that, go back and rephrase the translation shorter.
-
-```bash
-ffmpeg -i segment.wav -filter:a "atempo=1.1" segment_stretched.wav
-```
-
----
-
-## Stage 8 — Lip Sync (Optional)
-
-**Tool:** LatentSync 1.6 (quality) or MuseTalk 1.5 (speed)
-
-Only needed for close-up talking-head footage. Skip for B-roll, presentations, or distant/turned faces.
-
-- **LatentSync 1.6** — Best benchmark results, built on Stable Diffusion, excellent temporal consistency. ~8–10 GB VRAM.
-- **MuseTalk 1.5** — Real-time (30+ fps), MIT licensed, sharp output. ~6–8 GB VRAM.
-
----
-
-## Stage 9 — Final Mix + Render
-
-**Tool:** FFmpeg
-
-Combine the English voice track with the original instrumental stem from Stage 1. Target -16 LUFS for voice, duck music ~6 dB below.
-
-```bash
-ffmpeg -i video.mp4 -i english_voice.wav -i instrumental.wav \
-  -filter_complex "[1:a]volume=0dB[v];[2:a]volume=-6dB[m];[v][m]amix=inputs=2[mixed];[mixed]loudnorm=I=-16:TP=-1.5[out]" \
-  -map 0:v -map "[out]" -c:v copy -c:a aac -b:a 192k output.mp4
-```
+### 9. Final Mix
+- Positions aligned speech on the timeline
+- Mixes English speech with the instrumental stem
+- Normalizes output and remuxes it onto the original video as `output.mp4`
 
 ---
 
 ## Quick Reference
 
-| Stage | Tool | Type |
-|-------|------|------|
-| 1. Source separation | Mel-RoFormer (UVR5) | Local |
-| 2. Transcription + diarization | ElevenLabs Scribe v2 | API |
-| 3. Transcript review | Human | Manual |
-| 4. Translation | Claude | API |
-| 5. Translation review | Human | Manual |
-| 6. Voice cloning + TTS | ElevenLabs Dubbing Studio | API |
-| 7. Timing alignment | FFmpeg / Rubberband | Local |
-| 8. Lip sync | LatentSync 1.6 / MuseTalk 1.5 | Local |
-| 9. Final mix | FFmpeg | Local |
+| Stage | Implementation |
+|---|---|
+| 1. Source separation | Demucs auto-detect or custom command |
+| 2. Transcription | ElevenLabs Scribe v2 |
+| 3. Transcript review | Manual CSV approval |
+| 4. Translation | OpenRouter model |
+| 5. Translation review | Manual CSV approval |
+| 6. Voice prep | Speaker sample extraction + manual voice mapping |
+| 7. Synthesis | ElevenLabs TTS |
+| 8. Alignment | Rubber Band or FFmpeg |
+| 9. Final mix | FFmpeg-based render |
 
-**GPU:** A single RTX 3090/4090 (24 GB) handles all local stages. ElevenLabs stages run in the cloud.
+---
+
+## Scope Notes
+
+- The implemented workflow is designed for **Russian-to-English dubbing**
+- Lip sync is **not** part of the current repository
+- The jobs root is chosen at runtime; outputs are tracked through each job’s `manifest.json`
+
