@@ -202,6 +202,12 @@ class ElevenLabsClient:
             return response.body
         raise ElevenLabsError("ElevenLabs model list did not return JSON")
 
+    def list_voices(self) -> Dict[str, Any]:
+        response = self._request("GET", "/v1/voices", accept_json=True)
+        if isinstance(response.body, dict):
+            return response.body
+        raise ElevenLabsError("ElevenLabs voice list did not return JSON")
+
     def transcribe_audio(
         self,
         audio: AudioSource,

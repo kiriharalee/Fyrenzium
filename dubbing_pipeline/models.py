@@ -132,6 +132,10 @@ class PipelineSettings:
     scribe_keyterms: List[str] = field(default_factory=list)
     translation_glossary: List[str] = field(default_factory=list)
     speaker_voice_map: Dict[str, str] = field(default_factory=dict)
+    auto_approve_transcript_review: bool = False
+    auto_approve_translation_review: bool = False
+    auto_voice_id: str = ""
+    allow_alignment_overflow: bool = False
     estimated_speakers: Optional[int] = None
     syllables_per_second: float = 4.5
     max_duration_stretch: float = 0.15

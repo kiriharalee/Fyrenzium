@@ -14,6 +14,7 @@ from dubbing_pipeline.stages import (
     SynthesisStage,
     TranscriptionStage,
     TranscriptReviewStage,
+    TranslationStage,
     build_segments,
     estimate_syllables,
     normalize_words_to_single_speaker,
@@ -226,6 +227,105 @@ class StageHelperTests(unittest.TestCase):
         self.assertIn("Demucs was detected", result.message)
         self.assertIn("source_separation_command", result.message)
         self.assertIn("/usr/bin/demucs --two-stems vocals", result.message)
+
+    def test_source_separation_retries_after_installing_soundfile(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            source_audio = Path(temp_dir) / "source.wav"
+            source_audio.write_bytes(b"input-audio")
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4"), audio_path=source_audio),
+                PipelineSettings(),
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {})
+            backend_error = MediaToolError(
+                "Command failed with exit code 1: /usr/bin/demucs --two-stems vocals "
+                "-o /tmp/out /tmp/input.wav\n"
+                "RuntimeError: Couldn't find appropriate backend to handle uri "
+                "/tmp/out/vocals.wav and format None.\n"
+                "torchaudio backend unavailable"
+            )
+            call_counter = {"count": 0}
+
+            def fake_demucs_run(args):
+                call_counter["count"] += 1
+                if call_counter["count"] == 1:
+                    raise backend_error
+                output_root = job_dir / "01_source" / "demucs_output" / "htdemucs" / "input_audio"
+                output_root.mkdir(parents=True, exist_ok=True)
+                (output_root / "vocals.wav").write_bytes(b"isolated-vocals")
+                (output_root / "no_vocals.wav").write_bytes(b"isolated-music")
+
+            with patch("dubbing_pipeline.stages.which", return_value="/usr/bin/demucs"), patch(
+                "dubbing_pipeline.stages.run_command", side_effect=fake_demucs_run
+            ), patch.object(SourceSeparationStage, "_has_soundfile_module", return_value=False), patch.object(
+                SourceSeparationStage,
+                "_install_soundfile_module",
+                return_value=(True, "Installed the missing soundfile package and retried Demucs automatically."),
+            ) as install_mock, patch.object(
+                SourceSeparationStage,
+                "_probe_audio",
+                return_value={"codec_name": "pcm_s16le", "channels": 2, "sample_rate": 44100, "duration": "1.0", "size": "16"},
+            ), patch.object(SourceSeparationStage, "_audio_peak_dbfs", return_value=-12.0):
+                result = SourceSeparationStage().run(context)
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertEqual(call_counter["count"], 2)
+        install_mock.assert_called_once()
+
+    def test_translation_stage_resumes_from_existing_review_csv(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            approved_segments = job_dir / "02_transcript_review" / "transcript_segments_approved.json"
+            approved_segments.parent.mkdir(parents=True, exist_ok=True)
+            approved_segments.write_text(
+                (
+                    "[\n"
+                    '  {"segment_id":"s0001","speaker":"speaker_1","start_sec":0.0,"end_sec":1.0,"text":"Привет"},\n'
+                    '  {"segment_id":"s0002","speaker":"speaker_1","start_sec":1.0,"end_sec":2.0,"text":"Мир"}\n'
+                    "]\n"
+                ),
+                encoding="utf-8",
+            )
+            review_csv = job_dir / "03_translation" / "translation_review.csv"
+            review_csv.parent.mkdir(parents=True, exist_ok=True)
+            review_csv.write_text(
+                "segment_id,speaker,start_sec,end_sec,text_ru_final,text_en_draft,text_en_final,duration_sec,syllables_per_sec,overflow,approved,notes\n"
+                "s0001,speaker_1,0.0,1.0,Привет,Hello,Hello,1.0,2.0,false,false,\n",
+                encoding="utf-8",
+            )
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.TRANSCRIPT_REVIEW,
+                StageStatus.COMPLETED,
+                "done",
+                {"approved_segments": str(approved_segments)},
+            )
+            save_manifest(manifest)
+            context = build_context(job_dir, {"openrouter": "test-key"})
+            response = {"choices": [{"message": {"content": '{"translation":"World"}'}}]}
+
+            with patch("dubbing_pipeline.stages.OpenRouterClient.chat_completions", return_value=response) as chat_mock:
+                result = TranslationStage().run(context)
+
+            output_csv = Path(result.artifacts["translation_review_csv"]).read_text(encoding="utf-8")
+            draft_json = Path(result.artifacts["translation_segments"]).read_text(encoding="utf-8")
+
+        self.assertEqual(result.status.value, "completed")
+        self.assertEqual(chat_mock.call_count, 1)
+        self.assertIn("Hello", output_csv)
+        self.assertIn("World", output_csv)
+        self.assertIn('"segment_id": "s0001"', draft_json)
+        self.assertIn('"segment_id": "s0002"', draft_json)
 
     def test_source_separation_rejects_identical_vocals_output(self) -> None:
         with TemporaryDirectory() as temp_dir:

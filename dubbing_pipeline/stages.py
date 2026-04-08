@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import hashlib
 import math
 import re
 import shlex
 import shutil
+import sys
 import wave
 from abc import ABC, abstractmethod
 from dataclasses import asdict
@@ -255,6 +257,26 @@ def _find_demucs_stems(output_root: Path, input_audio: Path) -> Optional[Dict[st
     }
 
 
+def choose_translation_model(context: "PipelineContext", current_model: str) -> str:
+    if not sys.stdin.isatty():
+        raise MediaToolError(
+            f"Translation with model '{current_model}' needs manual intervention. "
+            "Rerun with a different --translation-model value."
+        )
+    model = input(f"OpenRouter model [{current_model}]: ").strip()
+    return model or current_model
+
+
+def request_retry_action(current_model: str, message: str) -> str:
+    if not sys.stdin.isatty():
+        raise MediaToolError(
+            f"Translation failed for model '{current_model}': {message}. "
+            "Rerun non-interactively with another --translation-model value."
+        )
+    print(message)
+    return input("Retry, switch model, or stop? [r/m/s]: ").strip().lower() or "r"
+
+
 class PipelineStage(ABC):
     """Base class for pipeline stages."""
 
@@ -281,6 +303,19 @@ class SourceSeparationStage(PipelineStage):
             or ("save_audio" in message and "torchaudio" in message)
         )
 
+    def _has_soundfile_module(self) -> bool:
+        return importlib.util.find_spec("soundfile") is not None
+
+    def _install_soundfile_module(self) -> tuple[bool, str]:
+        python = sys.executable or which("python3") or shutil.which("python")
+        if not python:
+            return False, "Could not locate a Python interpreter to install the missing soundfile package."
+        try:
+            run_command([python, "-m", "pip", "install", "--user", "soundfile"])
+        except MediaToolError as exc:
+            return False, f"Automatic installation of the soundfile package failed: {exc}"
+        return True, "Installed the missing soundfile package and retried Demucs automatically."
+
     def _demucs_backend_failure_message(
         self,
         *,
@@ -295,6 +330,19 @@ class SourceSeparationStage(PipelineStage):
             "machine or set source_separation_command to use a different backend, then rerun. "
             f"Attempted command: {attempted}"
         )
+
+    def _find_demucs_command(self) -> Optional[List[str]]:
+        demucs = which("demucs")
+        if demucs:
+            return [demucs]
+        python = which("python3") or shutil.which("python")
+        if not python:
+            return None
+        try:
+            run_command([python, "-m", "demucs", "--help"])
+        except MediaToolError:
+            return None
+        return [python, "-m", "demucs"]
 
     def _source_artifact_payload(
         self,
@@ -452,7 +500,6 @@ class SourceSeparationStage(PipelineStage):
         input_audio = stage_dir / "input_audio.wav"
         source_audio = context.source_media.audio_path
         if input_audio.exists():
-            # Reuse a previously prepared job-local input track when resuming.
             pass
         elif source_audio:
             input_audio.parent.mkdir(parents=True, exist_ok=True)
@@ -504,12 +551,12 @@ class SourceSeparationStage(PipelineStage):
                     "to auto and install demucs.",
                     {"input_audio": str(input_audio)},
                 )
-            demucs = which("demucs")
-            if demucs:
+            demucs_command_prefix = self._find_demucs_command()
+            if demucs_command_prefix:
                 demucs_output = stage_dir / "demucs_output"
                 shutil.rmtree(demucs_output, ignore_errors=True)
                 demucs_command = [
-                    demucs,
+                    *demucs_command_prefix,
                     "--two-stems",
                     "vocals",
                     "-o",
@@ -520,16 +567,34 @@ class SourceSeparationStage(PipelineStage):
                     run_command(demucs_command)
                 except MediaToolError as exc:
                     if self._is_demucs_backend_error(exc):
-                        return StageResult(
-                            self.stage_name,
-                            StageStatus.NEEDS_REVIEW,
-                            self._demucs_backend_failure_message(
+                        remediation_note = ""
+                        retry_error: Optional[MediaToolError] = exc
+                        if not self._has_soundfile_module():
+                            installed, remediation_note = self._install_soundfile_module()
+                            if installed:
+                                try:
+                                    run_command(demucs_command)
+                                except MediaToolError as retry_exc:
+                                    retry_error = retry_exc
+                                else:
+                                    retry_error = None
+                        if retry_error is not None and self._is_demucs_backend_error(retry_error):
+                            message = self._demucs_backend_failure_message(
                                 attempted_command=demucs_command,
                                 validation_prefix=validation_prefix,
-                            ),
-                            artifacts,
-                        )
-                    raise
+                            )
+                            if remediation_note:
+                                message = f"{message} {remediation_note}"
+                            return StageResult(
+                                self.stage_name,
+                                StageStatus.NEEDS_REVIEW,
+                                message,
+                                artifacts,
+                            )
+                        if retry_error is not None:
+                            raise retry_error
+                    else:
+                        raise
                 located = _find_demucs_stems(demucs_output, input_audio)
                 if located:
                     _copy_stem(located["vocals"], vocals_path)
@@ -627,6 +692,22 @@ class TranscriptReviewStage(PipelineStage):
         approved_json = stage_dir / "transcript_segments_approved.json"
         if review_csv.exists():
             rows = read_transcript_review_csv(review_csv)
+            if context.settings.auto_approve_transcript_review and rows:
+                rows = [
+                    TranscriptReviewRow(
+                        segment_id=row.segment_id,
+                        speaker=row.speaker,
+                        start_sec=row.start_sec,
+                        end_sec=row.end_sec,
+                        text_ru_raw=row.text_ru_raw,
+                        text_ru_final=row.text_ru_final or row.text_ru_raw,
+                        speaker_final=row.speaker_final or row.speaker,
+                        approved=True,
+                        notes=row.notes,
+                    )
+                    for row in rows
+                ]
+                write_transcript_review_csv(rows, review_csv)
             if review_rows_complete(rows):
                 segments = [
                     TranscriptSegment(
@@ -678,12 +759,22 @@ class TranscriptReviewStage(PipelineStage):
                 text_ru_raw=segment.text,
                 text_ru_final=segment.text,
                 speaker_final=segment.speaker,
-                approved=False,
+                approved=bool(context.settings.auto_approve_transcript_review),
                 notes="",
             )
             for segment in segments
         ]
         write_transcript_review_csv(rows, review_csv)
+        if context.settings.auto_approve_transcript_review:
+            write_json(approved_json, [segment.to_dict() for segment in segments])
+            return StageResult(
+                self.stage_name,
+                StageStatus.COMPLETED,
+                artifacts={
+                    "transcript_review_csv": str(review_csv),
+                    "approved_segments": str(approved_json),
+                },
+            )
         return StageResult(
             self.stage_name,
             StageStatus.NEEDS_REVIEW,
@@ -695,17 +786,47 @@ class TranscriptReviewStage(PipelineStage):
 class TranslationStage(PipelineStage):
     stage_name = StageName.TRANSLATION
 
+    def _load_existing_rows(self, review_csv: Path) -> Dict[str, TranslationReviewRow]:
+        if not review_csv.exists():
+            return {}
+        return {row.segment_id: row for row in read_translation_review_csv(review_csv)}
+
+    def _build_translation_row(
+        self,
+        segment: TranscriptSegment,
+        translation: str,
+        syllables_per_second: float,
+        approved: bool = False,
+        notes: str = "",
+    ) -> TranslationReviewRow:
+        syllables = estimate_syllables(translation)
+        duration = max(0.001, segment.end_sec - segment.start_sec)
+        syllables_per_sec = syllables / duration
+        return TranslationReviewRow(
+            segment_id=segment.segment_id,
+            speaker=segment.speaker,
+            start_sec=segment.start_sec,
+            end_sec=segment.end_sec,
+            text_ru_final=segment.text,
+            text_en_draft=translation,
+            text_en_final=translation,
+            duration_sec=duration,
+            syllables_per_sec=syllables_per_sec,
+            overflow=syllables_per_sec > syllables_per_second,
+            approved=approved,
+            notes=notes,
+        )
+
+    def _checkpoint_rows(self, rows: Sequence[TranslationReviewRow], review_csv: Path, draft_json: Path) -> None:
+        write_translation_review_csv(rows, review_csv)
+        write_json(draft_json, [asdict(row) for row in rows])
+
     def run(self, context: "PipelineContext") -> "StageResult":
         from .pipeline import StageResult
 
         stage_dir = context.stage_dir(self.stage_name)
         review_csv = stage_dir / "translation_review.csv"
-        if review_csv.exists():
-            return StageResult(
-                self.stage_name,
-                StageStatus.COMPLETED,
-                artifacts={"translation_review_csv": str(review_csv)},
-            )
+        draft_json = stage_dir / "translation_segments.json"
 
         transcript_path = context.stage_artifact_path(StageName.TRANSCRIPT_REVIEW, "approved_segments")
         if transcript_path is None:
@@ -714,14 +835,51 @@ class TranslationStage(PipelineStage):
         if not segments:
             raise MediaToolError("No approved transcript segments were found.")
 
+        existing_rows = self._load_existing_rows(review_csv)
+        rows: List[TranslationReviewRow] = []
+        missing_segment_ids = []
+        for segment in segments:
+            existing = existing_rows.get(segment.segment_id)
+            if existing and (existing.text_en_final or existing.text_en_draft):
+                rows.append(
+                    TranslationReviewRow(
+                        segment_id=segment.segment_id,
+                        speaker=segment.speaker,
+                        start_sec=segment.start_sec,
+                        end_sec=segment.end_sec,
+                        text_ru_final=segment.text,
+                        text_en_draft=existing.text_en_draft,
+                        text_en_final=existing.text_en_final or existing.text_en_draft,
+                        duration_sec=max(0.001, segment.end_sec - segment.start_sec),
+                        syllables_per_sec=existing.syllables_per_sec,
+                        overflow=existing.overflow,
+                        approved=existing.approved,
+                        notes=existing.notes,
+                    )
+                )
+            else:
+                missing_segment_ids.append(segment.segment_id)
+        if not missing_segment_ids and rows:
+            self._checkpoint_rows(rows, review_csv, draft_json)
+            return StageResult(
+                self.stage_name,
+                StageStatus.COMPLETED,
+                artifacts={
+                    "translation_review_csv": str(review_csv),
+                    "translation_segments": str(draft_json),
+                },
+            )
+
         api_key = context.api_keys.get("openrouter")
         if not api_key:
             raise MediaToolError("Missing OpenRouter API key.")
 
         model = context.settings.translation_model
         client = OpenRouterClient(api_key)
-        rows: List[TranslationReviewRow] = []
+        completed_by_id = {row.segment_id: row for row in rows}
         for index, segment in enumerate(segments):
+            if segment.segment_id in completed_by_id:
+                continue
             while True:
                 try:
                     prompt = translation_prompt(
@@ -738,59 +896,58 @@ class TranslationStage(PipelineStage):
                         ],
                         model=model,
                         temperature=0.2,
-                        response_format={"type": "json_object"},
                     )
                     translation = parse_translation_content(client.extract_message_content(response))
+                    row = self._build_translation_row(
+                        segment,
+                        translation,
+                        context.settings.syllables_per_second,
+                    )
+                    completed_by_id[row.segment_id] = row
+                    rows = [completed_by_id[item.segment_id] for item in segments if item.segment_id in completed_by_id]
+                    self._checkpoint_rows(rows, review_csv, draft_json)
                     break
                 except OpenRouterRateLimitError as exc:
-                    print(f"OpenRouter rate limit: {exc}")
-                    action = input("Retry, switch model, or stop? [r/m/s]: ").strip().lower() or "r"
+                    action = request_retry_action(model, f"OpenRouter rate limit: {exc}")
                     if action == "m":
-                        model = input(f"OpenRouter model [{model}]: ").strip() or model
+                        model = choose_translation_model(context, model)
                         context.settings.translation_model = model
+                        context.save()
                         continue
                     if action == "s":
                         return StageResult(
                             self.stage_name,
                             StageStatus.FAILED,
                             "Translation stopped after OpenRouter rate limit.",
+                            artifacts={
+                                "translation_review_csv": str(review_csv),
+                                "translation_segments": str(draft_json),
+                            }
+                            if review_csv.exists()
+                            else {},
                         )
                 except (OpenRouterAPIError, OpenRouterError, MediaToolError) as exc:
-                    print(f"Translation error: {exc}")
-                    action = input("Retry, switch model, or stop? [r/m/s]: ").strip().lower() or "r"
+                    action = request_retry_action(model, f"Translation error: {exc}")
                     if action == "m":
-                        model = input(f"OpenRouter model [{model}]: ").strip() or model
+                        model = choose_translation_model(context, model)
                         context.settings.translation_model = model
+                        context.save()
                         continue
                     if action == "s":
                         return StageResult(
                             self.stage_name,
                             StageStatus.FAILED,
                             "Translation stopped before the draft CSV was complete.",
+                            artifacts={
+                                "translation_review_csv": str(review_csv),
+                                "translation_segments": str(draft_json),
+                            }
+                            if review_csv.exists()
+                            else {},
                         )
 
-            syllables = estimate_syllables(translation)
-            duration = max(0.001, segment.end_sec - segment.start_sec)
-            rows.append(
-                TranslationReviewRow(
-                    segment_id=segment.segment_id,
-                    speaker=segment.speaker,
-                    start_sec=segment.start_sec,
-                    end_sec=segment.end_sec,
-                    text_ru_final=segment.text,
-                    text_en_draft=translation,
-                    text_en_final=translation,
-                    duration_sec=duration,
-                    syllables_per_sec=syllables / duration,
-                    overflow=(syllables / duration) > context.settings.syllables_per_second,
-                    approved=False,
-                    notes="",
-                )
-            )
-
-        draft_json = stage_dir / "translation_segments.json"
-        write_translation_review_csv(rows, review_csv)
-        write_json(draft_json, [asdict(row) for row in rows])
+        rows = [completed_by_id[item.segment_id] for item in segments if item.segment_id in completed_by_id]
+        self._checkpoint_rows(rows, review_csv, draft_json)
         return StageResult(
             self.stage_name,
             StageStatus.COMPLETED,
@@ -814,6 +971,25 @@ class TranslationReviewStage(PipelineStage):
             raise MediaToolError("Missing translation review CSV.")
 
         rows = read_translation_review_csv(review_csv)
+        if context.settings.auto_approve_translation_review and rows:
+            rows = [
+                TranslationReviewRow(
+                    segment_id=row.segment_id,
+                    speaker=row.speaker,
+                    start_sec=row.start_sec,
+                    end_sec=row.end_sec,
+                    text_ru_final=row.text_ru_final,
+                    text_en_draft=row.text_en_draft,
+                    text_en_final=row.text_en_final or row.text_en_draft,
+                    duration_sec=row.duration_sec,
+                    syllables_per_sec=row.syllables_per_sec,
+                    overflow=row.overflow,
+                    approved=True,
+                    notes=row.notes,
+                )
+                for row in rows
+            ]
+            write_translation_review_csv(rows, review_csv)
         if review_rows_complete(rows):
             segments = [
                 TranslationSegment(
@@ -859,6 +1035,10 @@ class VoicePrepStage(PipelineStage):
             raise MediaToolError("Voice prep needs approved transcript segments and the vocals stem.")
 
         segments = [TranscriptSegment(**item) for item in read_json(transcript_path, default=[]) or []]
+        if context.settings.auto_voice_id.strip():
+            for segment in segments:
+                context.settings.speaker_voice_map.setdefault(segment.speaker, context.settings.auto_voice_id)
+            context.save()
         sample_dir = stage_dir / "speaker_samples"
         manifest_entries: List[Dict[str, Any]] = []
         speakers_seen: Dict[str, int] = {}
@@ -1052,15 +1232,21 @@ class AlignmentStage(PipelineStage):
             speed_factor = actual_duration / target_duration
             aligned_path = stage_dir / f"{item['segment_id']}_aligned.wav"
             if abs(1.0 - speed_factor) > context.settings.max_duration_stretch:
-                issues.append(
-                    {
-                        "segment_id": item["segment_id"],
-                        "speaker": item["speaker"],
-                        "required_speed_factor": speed_factor,
-                        "message": "Segment needs translation shortening or re-phrasing.",
-                    }
-                )
-                continue
+                if context.settings.allow_alignment_overflow:
+                    speed_factor = min(
+                        max(speed_factor, 0.5),
+                        100.0,
+                    )
+                else:
+                    issues.append(
+                        {
+                            "segment_id": item["segment_id"],
+                            "speaker": item["speaker"],
+                            "required_speed_factor": speed_factor,
+                            "message": "Segment needs translation shortening or re-phrasing.",
+                        }
+                    )
+                    continue
             if which("rubberband"):
                 stretch_audio_rubberband(source, aligned_path, speed_factor)
             else:
