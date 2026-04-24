@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class StageName(str, Enum):
@@ -38,11 +38,11 @@ class SourceMedia:
     """Source assets selected for a job."""
 
     video_path: Path
-    audio_path: Optional[Path] = None
+    audio_path: Path | None = None
     language: str = "ru"
-    title: Optional[str] = None
+    title: str | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["video_path"] = str(self.video_path)
         data["audio_path"] = str(self.audio_path) if self.audio_path else None
@@ -54,11 +54,11 @@ class VoiceProfile:
     """Voice identity and supporting samples for a speaker."""
 
     speaker_label: str
-    voice_id: Optional[str] = None
-    sample_paths: List[Path] = field(default_factory=list)
+    voice_id: str | None = None
+    sample_paths: list[Path] = field(default_factory=list)
     notes: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["sample_paths"] = [str(path) for path in self.sample_paths]
         return data
@@ -71,10 +71,10 @@ class TranscriptWord:
     word: str
     start_sec: float
     end_sec: float
-    confidence: Optional[float] = None
-    speaker: Optional[str] = None
+    confidence: float | None = None
+    speaker: str | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -87,11 +87,11 @@ class TranscriptSegment:
     start_sec: float
     end_sec: float
     text: str
-    words: List[TranscriptWord] = field(default_factory=list)
-    confidence: Optional[float] = None
+    words: list[TranscriptWord] = field(default_factory=list)
+    confidence: float | None = None
     needs_review: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["words"] = [word.to_dict() for word in self.words]
         return data
@@ -107,11 +107,11 @@ class TranslationSegment:
     end_sec: float
     source_text: str
     translated_text: str = ""
-    target_syllables: Optional[int] = None
+    target_syllables: int | None = None
     overflow: bool = False
     notes: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -129,9 +129,9 @@ class PipelineSettings:
     elevenlabs_tts_model: str = "eleven_multilingual_v2"
     openrouter_api_key_env: str = "OPENROUTER_API_KEY"
     translation_model: str = "minimax/minimax-m2.5:free"
-    scribe_keyterms: List[str] = field(default_factory=list)
-    translation_glossary: List[str] = field(default_factory=list)
-    speaker_voice_map: Dict[str, str] = field(default_factory=dict)
+    scribe_keyterms: list[str] = field(default_factory=list)
+    translation_glossary: list[str] = field(default_factory=list)
+    speaker_voice_map: dict[str, str] = field(default_factory=dict)
     auto_approve_transcript_review: bool = False
     auto_approve_translation_review: bool = False
     auto_voice_id: str = ""
@@ -142,14 +142,14 @@ class PipelineSettings:
     voice_clone_max_seconds: float = 300.0
     voice_clone_remove_background_noise: bool = False
     allow_alignment_overflow: bool = False
-    estimated_speakers: Optional[int] = None
+    estimated_speakers: int | None = None
     syllables_per_second: float = 4.5
     max_duration_stretch: float = 0.15
     low_confidence_threshold: float = 0.75
     segment_gap_seconds: float = 0.8
     max_segment_seconds: float = 8.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -159,12 +159,12 @@ class StageRecord:
 
     name: StageName
     status: StageStatus = StageStatus.PENDING
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
+    started_at: str | None = None
+    completed_at: str | None = None
     message: str = ""
-    artifacts: Dict[str, str] = field(default_factory=dict)
+    artifacts: dict[str, str] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["name"] = self.name.value
         data["status"] = self.status.value
@@ -179,12 +179,12 @@ class JobManifest:
     job_dir: Path
     source_media: SourceMedia
     settings: PipelineSettings
-    stage_records: List[StageRecord]
+    stage_records: list[StageRecord]
     created_at: str
     updated_at: str
     notes: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "job_name": self.job_name,
             "job_dir": str(self.job_dir),

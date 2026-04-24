@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Sequence
 
 from .media import MediaToolError
 from .models import JobManifest, StageName, StageStatus
@@ -31,7 +31,7 @@ class StageResult:
     stage_name: StageName
     status: StageStatus
     message: str = ""
-    artifacts: Dict[str, str] = field(default_factory=dict)
+    artifacts: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -40,7 +40,7 @@ class PipelineContext:
 
     manifest: JobManifest
     manifest_path: Path
-    api_keys: Dict[str, str]
+    api_keys: dict[str, str]
 
     def save(self) -> Path:
         return save_manifest(self.manifest)
@@ -66,10 +66,10 @@ class PipelineContext:
     def stage_status(self, stage_name: StageName) -> StageStatus:
         return stage_lookup(self.manifest)[stage_name].status
 
-    def stage_artifacts(self, stage_name: StageName) -> Dict[str, str]:
+    def stage_artifacts(self, stage_name: StageName) -> dict[str, str]:
         return stage_lookup(self.manifest)[stage_name].artifacts
 
-    def stage_artifact_path(self, stage_name: StageName, key: str) -> Optional[Path]:
+    def stage_artifact_path(self, stage_name: StageName, key: str) -> Path | None:
         value = self.stage_artifacts(stage_name).get(key)
         return Path(value) if value else None
 
@@ -84,7 +84,7 @@ class PipelineContext:
         self.save()
 
 
-def build_context(job_dir: Path, api_keys: Dict[str, str]) -> PipelineContext:
+def build_context(job_dir: Path, api_keys: dict[str, str]) -> PipelineContext:
     manifest = load_manifest(job_dir)
     return PipelineContext(
         manifest=manifest,
@@ -135,7 +135,7 @@ class PipelineRunner:
         return self.context.manifest
 
 
-def load_runner(job_dir: Path, api_keys: Dict[str, str]) -> PipelineRunner:
+def load_runner(job_dir: Path, api_keys: dict[str, str]) -> PipelineRunner:
     from .stages import build_default_stages
 
     return PipelineRunner(build_context(job_dir, api_keys), build_default_stages())

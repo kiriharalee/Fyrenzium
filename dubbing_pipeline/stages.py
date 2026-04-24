@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import hashlib
+import json
 import math
 import re
 import shlex
@@ -12,9 +12,10 @@ import shutil
 import sys
 import wave
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Any
 
 from .media import (
     MediaToolError,
@@ -85,7 +86,78 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha1(encoded).hexdigest()
 
 
-def extract_words(payload: Mapping[str, Any] | Sequence[Any]) -> List[TranscriptWord]:
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def transcript_word_from_dict(item: TranscriptWord | Mapping[str, Any]) -> TranscriptWord:
+    if isinstance(item, TranscriptWord):
+        return item
+    return TranscriptWord(
+        word=str(item.get("word", "")),
+        start_sec=float(item.get("start_sec", 0.0)),
+        end_sec=float(item.get("end_sec", 0.0)),
+        confidence=_optional_float(item.get("confidence")),
+        speaker=str(item["speaker"]) if item.get("speaker") is not None else None,
+    )
+
+
+def hydrate_transcript_words(raw_words: Iterable[Any]) -> list[TranscriptWord]:
+    return [
+        transcript_word_from_dict(word)
+        for word in raw_words
+        if isinstance(word, (TranscriptWord, Mapping))
+    ]
+
+
+def transcript_segment_from_dict(item: TranscriptSegment | Mapping[str, Any]) -> TranscriptSegment:
+    if isinstance(item, TranscriptSegment):
+        raw_words = item.words
+        return TranscriptSegment(
+            segment_id=item.segment_id,
+            speaker=item.speaker,
+            start_sec=item.start_sec,
+            end_sec=item.end_sec,
+            text=item.text,
+            words=hydrate_transcript_words(raw_words),
+            confidence=item.confidence,
+            needs_review=item.needs_review,
+        )
+    return TranscriptSegment(
+        segment_id=str(item.get("segment_id", "")),
+        speaker=str(item.get("speaker") or "speaker_1"),
+        start_sec=float(item.get("start_sec", 0.0)),
+        end_sec=float(item.get("end_sec", 0.0)),
+        text=str(item.get("text", "")),
+        words=hydrate_transcript_words(item.get("words") or []),
+        confidence=_optional_float(item.get("confidence")),
+        needs_review=bool(item.get("needs_review", False)),
+    )
+
+
+def translation_segment_from_dict(item: TranslationSegment | Mapping[str, Any]) -> TranslationSegment:
+    if isinstance(item, TranslationSegment):
+        return item
+    target_syllables = item.get("target_syllables")
+    return TranslationSegment(
+        segment_id=str(item.get("segment_id", "")),
+        speaker=str(item.get("speaker") or "speaker_1"),
+        start_sec=float(item.get("start_sec", 0.0)),
+        end_sec=float(item.get("end_sec", 0.0)),
+        source_text=str(item.get("source_text", "")),
+        translated_text=str(item.get("translated_text", "")),
+        target_syllables=int(target_syllables) if target_syllables is not None else None,
+        overflow=bool(item.get("overflow", False)),
+        notes=str(item.get("notes", "")),
+    )
+
+
+def extract_words(payload: Mapping[str, Any] | Sequence[Any]) -> list[TranscriptWord]:
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
         candidates: Iterable[Any] = payload
     else:
@@ -97,7 +169,7 @@ def extract_words(payload: Mapping[str, Any] | Sequence[Any]) -> List[Transcript
                     candidates = nested
                     break
 
-    words: List[TranscriptWord] = []
+    words: list[TranscriptWord] = []
     for item in candidates:
         if not isinstance(item, Mapping):
             continue
@@ -129,7 +201,7 @@ def extract_words(payload: Mapping[str, Any] | Sequence[Any]) -> List[Transcript
 
 def normalize_words_to_single_speaker(
     words: Sequence[TranscriptWord], speaker_label: str = "speaker_1"
-) -> List[TranscriptWord]:
+) -> list[TranscriptWord]:
     return [
         TranscriptWord(
             word=word.word,
@@ -142,12 +214,17 @@ def normalize_words_to_single_speaker(
     ]
 
 
-def build_segments(words: Sequence[TranscriptWord], gap_threshold: float, max_segment_sec: float) -> List[TranscriptSegment]:
+def build_segments(
+    words: Sequence[TranscriptWord],
+    gap_threshold: float,
+    max_segment_sec: float,
+    low_confidence_threshold: float = 0.75,
+) -> list[TranscriptSegment]:
     if not words:
         return []
 
-    segments: List[TranscriptSegment] = []
-    bucket: List[TranscriptWord] = [words[0]]
+    segments: list[TranscriptSegment] = []
+    bucket: list[TranscriptWord] = [words[0]]
     current_speaker = words[0].speaker or "speaker_1"
 
     def flush(index: int) -> None:
@@ -165,7 +242,7 @@ def build_segments(words: Sequence[TranscriptWord], gap_threshold: float, max_se
                 text=text,
                 words=list(bucket),
                 confidence=confidence,
-                needs_review=confidence is None or confidence < 0.75,
+                needs_review=confidence is None or confidence < low_confidence_threshold,
             )
         )
 
@@ -248,7 +325,7 @@ def _copy_stem(source: Path, target: Path) -> Path:
     return target
 
 
-def _find_demucs_stems(output_root: Path, input_audio: Path) -> Optional[Dict[str, Path]]:
+def _find_demucs_stems(output_root: Path, input_audio: Path) -> dict[str, Path] | None:
     stem_name = input_audio.stem
     vocals_candidates = sorted(output_root.rglob(f"{stem_name}/vocals.wav"))
     instrumental_candidates = sorted(output_root.rglob(f"{stem_name}/no_vocals.wav"))
@@ -309,16 +386,6 @@ class SourceSeparationStage(PipelineStage):
     def _has_soundfile_module(self) -> bool:
         return importlib.util.find_spec("soundfile") is not None
 
-    def _install_soundfile_module(self) -> tuple[bool, str]:
-        python = sys.executable or which("python3") or shutil.which("python")
-        if not python:
-            return False, "Could not locate a Python interpreter to install the missing soundfile package."
-        try:
-            run_command([python, "-m", "pip", "install", "--user", "soundfile"])
-        except MediaToolError as exc:
-            return False, f"Automatic installation of the soundfile package failed: {exc}"
-        return True, "Installed the missing soundfile package and retried Demucs automatically."
-
     def _demucs_backend_failure_message(
         self,
         *,
@@ -330,11 +397,12 @@ class SourceSeparationStage(PipelineStage):
             validation_prefix
             + "Demucs was detected but could not write separated audio because its Python "
             "audio backend is unavailable. Fix the Demucs/Torchaudio environment on this "
-            "machine or set source_separation_command to use a different backend, then rerun. "
+            "machine, install the missing soundfile package, or set source_separation_command "
+            "to use a different backend, then rerun. "
             f"Attempted command: {attempted}"
         )
 
-    def _find_demucs_command(self) -> Optional[List[str]]:
+    def _find_demucs_command(self) -> list[str] | None:
         demucs = which("demucs")
         if demucs:
             return [demucs]
@@ -355,8 +423,8 @@ class SourceSeparationStage(PipelineStage):
         instrumental_path: Path,
         backend: str,
         command: str,
-        raw_output_dir: Optional[Path] = None,
-    ) -> Dict[str, str]:
+        raw_output_dir: Path | None = None,
+    ) -> dict[str, str]:
         payload = {
             "input_audio": str(input_audio),
             "vocals": str(vocals_path),
@@ -385,7 +453,7 @@ class SourceSeparationStage(PipelineStage):
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def _probe_audio(self, path: Path) -> Dict[str, Any]:
+    def _probe_audio(self, path: Path) -> dict[str, Any]:
         ffprobe = require_executable("ffprobe", "Install FFmpeg to inspect separated audio.")
         result = run_command(
             [
@@ -452,7 +520,7 @@ class SourceSeparationStage(PipelineStage):
         vocals_path: Path,
         instrumental_path: Path,
         artifacts: Mapping[str, str],
-    ) -> Optional[str]:
+    ) -> str | None:
         for path in (vocals_path, instrumental_path):
             if not path.exists():
                 return f"Missing expected output file: {path.name}."
@@ -502,13 +570,11 @@ class SourceSeparationStage(PipelineStage):
         stage_dir = context.stage_dir(self.stage_name)
         input_audio = stage_dir / "input_audio.wav"
         source_audio = context.source_media.audio_path
-        if input_audio.exists():
-            pass
-        elif source_audio:
+        if not input_audio.exists() and source_audio:
             input_audio.parent.mkdir(parents=True, exist_ok=True)
             if input_audio != source_audio:
                 input_audio.write_bytes(source_audio.read_bytes())
-        else:
+        elif not input_audio.exists():
             extract_audio_from_video(context.source_media.video_path, input_audio)
 
         vocals_path = stage_dir / "vocals.wav"
@@ -538,10 +604,10 @@ class SourceSeparationStage(PipelineStage):
             validation_prefix = (
                 f"Existing source-separation outputs are invalid: {invalid_existing_message} "
             )
-        artifacts: Dict[str, str] = {"input_audio": str(input_audio)}
+        artifacts: dict[str, str] = {"input_audio": str(input_audio)}
         backend_name = ""
         command_used = ""
-        raw_output_dir: Optional[Path] = None
+        raw_output_dir: Path | None = None
         if not command_template:
             if runner_name not in {"", "auto", "demucs"}:
                 return StageResult(
@@ -570,32 +636,18 @@ class SourceSeparationStage(PipelineStage):
                     run_command(demucs_command)
                 except MediaToolError as exc:
                     if self._is_demucs_backend_error(exc):
-                        remediation_note = ""
-                        retry_error: Optional[MediaToolError] = exc
+                        message = self._demucs_backend_failure_message(
+                            attempted_command=demucs_command,
+                            validation_prefix=validation_prefix,
+                        )
                         if not self._has_soundfile_module():
-                            installed, remediation_note = self._install_soundfile_module()
-                            if installed:
-                                try:
-                                    run_command(demucs_command)
-                                except MediaToolError as retry_exc:
-                                    retry_error = retry_exc
-                                else:
-                                    retry_error = None
-                        if retry_error is not None and self._is_demucs_backend_error(retry_error):
-                            message = self._demucs_backend_failure_message(
-                                attempted_command=demucs_command,
-                                validation_prefix=validation_prefix,
-                            )
-                            if remediation_note:
-                                message = f"{message} {remediation_note}"
-                            return StageResult(
-                                self.stage_name,
-                                StageStatus.NEEDS_REVIEW,
-                                message,
-                                artifacts,
-                            )
-                        if retry_error is not None:
-                            raise retry_error
+                            message = f"{message} Suggested fix: python -m pip install soundfile"
+                        return StageResult(
+                            self.stage_name,
+                            StageStatus.NEEDS_REVIEW,
+                            message,
+                            artifacts,
+                        )
                     else:
                         raise
                 located = _find_demucs_stems(demucs_output, input_audio)
@@ -667,14 +719,17 @@ class TranscriptionStage(PipelineStage):
         if not api_key:
             raise MediaToolError("Missing ElevenLabs API key.")
         client = ElevenLabsClient(api_key)
-        payload = client.transcribe_audio(
-            vocals_path,
-            model_id=context.settings.elevenlabs_scribe_model,
-            language_code=context.settings.source_language,
-            diarize=not context.settings.simple_mode,
-            num_speakers=1 if context.settings.simple_mode else context.settings.estimated_speakers,
-            keyterms=context.settings.scribe_keyterms,
-        )
+        try:
+            payload = client.transcribe_audio(
+                vocals_path,
+                model_id=context.settings.elevenlabs_scribe_model,
+                language_code=context.settings.source_language,
+                diarize=not context.settings.simple_mode,
+                num_speakers=1 if context.settings.simple_mode else context.settings.estimated_speakers,
+                keyterms=context.settings.scribe_keyterms,
+            )
+        except ElevenLabsError as exc:
+            raise MediaToolError(f"ElevenLabs transcription failed: {exc}") from exc
         raw_path = context.stage_dir(self.stage_name) / "transcript_raw.json"
         write_json(raw_path, payload)
         return StageResult(
@@ -751,6 +806,7 @@ class TranscriptReviewStage(PipelineStage):
             words,
             context.settings.segment_gap_seconds,
             context.settings.max_segment_seconds,
+            context.settings.low_confidence_threshold,
         )
         write_json(stage_dir / "transcript_segments.json", [segment.to_dict() for segment in segments])
         rows = [
@@ -789,7 +845,7 @@ class TranscriptReviewStage(PipelineStage):
 class TranslationStage(PipelineStage):
     stage_name = StageName.TRANSLATION
 
-    def _load_existing_rows(self, review_csv: Path) -> Dict[str, TranslationReviewRow]:
+    def _load_existing_rows(self, review_csv: Path) -> dict[str, TranslationReviewRow]:
         if not review_csv.exists():
             return {}
         return {row.segment_id: row for row in read_translation_review_csv(review_csv)}
@@ -834,12 +890,12 @@ class TranslationStage(PipelineStage):
         transcript_path = context.stage_artifact_path(StageName.TRANSCRIPT_REVIEW, "approved_segments")
         if transcript_path is None:
             raise MediaToolError("Transcript review has not been approved yet.")
-        segments = [TranscriptSegment(**item) for item in read_json(transcript_path, default=[]) or []]
+        segments = [transcript_segment_from_dict(item) for item in read_json(transcript_path, default=[]) or []]
         if not segments:
             raise MediaToolError("No approved transcript segments were found.")
 
         existing_rows = self._load_existing_rows(review_csv)
-        rows: List[TranslationReviewRow] = []
+        rows: list[TranslationReviewRow] = []
         missing_segment_ids = []
         for segment in segments:
             existing = existing_rows.get(segment.segment_id)
@@ -1031,8 +1087,8 @@ class VoicePrepStage(PipelineStage):
     boundary_padding_seconds = 0.12
     minimum_nonsilent_seconds = 0.5
 
-    def _speaker_groups(self, segments: Sequence[TranscriptSegment]) -> Dict[str, List[TranscriptSegment]]:
-        grouped: Dict[str, List[TranscriptSegment]] = {}
+    def _speaker_groups(self, segments: Sequence[TranscriptSegment]) -> dict[str, list[TranscriptSegment]]:
+        grouped: dict[str, list[TranscriptSegment]] = {}
         for segment in segments:
             grouped.setdefault(segment.speaker, []).append(segment)
         return grouped
@@ -1042,9 +1098,9 @@ class VoicePrepStage(PipelineStage):
         speaker_segments: Sequence[TranscriptSegment],
         *,
         low_confidence_threshold: float,
-    ) -> List[Dict[str, Any]]:
-        preferred: List[Dict[str, Any]] = []
-        fallback: List[Dict[str, Any]] = []
+    ) -> list[dict[str, Any]]:
+        preferred: list[dict[str, Any]] = []
+        fallback: list[dict[str, Any]] = []
         for segment in speaker_segments:
             original_duration = max(0.0, segment.end_sec - segment.start_sec)
             if original_duration < 0.5:
@@ -1081,14 +1137,14 @@ class VoicePrepStage(PipelineStage):
         *,
         vocals_path: Path,
         speaker: str,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[dict[str, Any]],
         speaker_dir: Path,
         min_seconds: float,
         target_seconds: float,
         max_seconds: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         raw_dir = speaker_dir / "raw_segments"
-        selected_chunks: List[Dict[str, Any]] = []
+        selected_chunks: list[dict[str, Any]] = []
         combined_seconds = 0.0
         for candidate in candidates:
             if combined_seconds >= target_seconds and combined_seconds >= min_seconds:
@@ -1173,16 +1229,16 @@ class VoicePrepStage(PipelineStage):
         if transcript_path is None or vocals_path is None:
             raise MediaToolError("Voice prep needs approved transcript segments and the vocals stem.")
 
-        segments = [TranscriptSegment(**item) for item in read_json(transcript_path, default=[]) or []]
+        segments = [transcript_segment_from_dict(item) for item in read_json(transcript_path, default=[]) or []]
         if context.settings.auto_voice_id.strip():
             for segment in segments:
                 context.settings.speaker_voice_map.setdefault(segment.speaker, context.settings.auto_voice_id)
             context.save()
 
         sample_dir = stage_dir / "speaker_samples"
-        manifest_entries: List[Dict[str, Any]] = []
+        manifest_entries: list[dict[str, Any]] = []
         speaker_groups = self._speaker_groups(segments)
-        missing_speakers: List[str] = []
+        missing_speakers: list[str] = []
         api_key = context.api_keys.get("elevenlabs")
         client = ElevenLabsClient(api_key, default_model_id=context.settings.elevenlabs_tts_model) if api_key else None
 
@@ -1341,12 +1397,12 @@ class SynthesisStage(PipelineStage):
         translations_path = context.stage_artifact_path(StageName.TRANSLATION_REVIEW, "approved_translations")
         if translations_path is None:
             raise MediaToolError("Translation review must be approved before synthesis.")
-        translations = [TranslationSegment(**item) for item in read_json(translations_path, default=[]) or []]
+        translations = [translation_segment_from_dict(item) for item in read_json(translations_path, default=[]) or []]
         api_key = context.api_keys.get("elevenlabs")
         if not api_key:
             raise MediaToolError("Missing ElevenLabs API key.")
         client = ElevenLabsClient(api_key, default_model_id=context.settings.elevenlabs_tts_model)
-        manifest_entries: List[Dict[str, Any]] = []
+        manifest_entries: list[dict[str, Any]] = []
         for segment in translations:
             voice_id = context.settings.speaker_voice_map.get(segment.speaker)
             if not voice_id:
@@ -1356,13 +1412,16 @@ class SynthesisStage(PipelineStage):
                     f"Missing voice_id for speaker {segment.speaker}.",
                 )
             output_path = stage_dir / segment.speaker / f"{segment.segment_id}.mp3"
-            client.save_speech_to_file(
-                segment.translated_text,
-                voice_id,
-                output_path,
-                model_id=context.settings.elevenlabs_tts_model,
-                output_format="mp3_44100_128",
-            )
+            try:
+                client.save_speech_to_file(
+                    segment.translated_text,
+                    voice_id,
+                    output_path,
+                    model_id=context.settings.elevenlabs_tts_model,
+                    output_format="mp3_44100_128",
+                )
+            except ElevenLabsError as exc:
+                raise MediaToolError(f"ElevenLabs synthesis failed for {segment.segment_id}: {exc}") from exc
             manifest_entries.append(
                 {
                     "segment_id": segment.segment_id,
@@ -1428,8 +1487,8 @@ class AlignmentStage(PipelineStage):
         if synthesis_path is None:
             raise MediaToolError("Synthesis must complete before alignment.")
         items = read_json(synthesis_path, default=[]) or []
-        issues: List[Dict[str, Any]] = []
-        aligned: List[Dict[str, Any]] = []
+        issues: list[dict[str, Any]] = []
+        aligned: list[dict[str, Any]] = []
         for item in items:
             source = Path(item["audio_path"])
             actual_duration = float(item["duration_sec"])
@@ -1536,7 +1595,7 @@ class FinalMixStage(PipelineStage):
         if not items:
             raise MediaToolError("No aligned segments were found.")
 
-        positioned_tracks: List[Path] = []
+        positioned_tracks: list[Path] = []
         for item in items:
             positioned_path = stage_dir / "positioned" / f"{item['segment_id']}.wav"
             pad_audio_with_silence(Path(item["audio_path"]), positioned_path, float(item["start_sec"]))
@@ -1573,7 +1632,7 @@ class FinalMixStage(PipelineStage):
         )
 
 
-def build_default_stages() -> List[PipelineStage]:
+def build_default_stages() -> list[PipelineStage]:
     return [
         SourceSeparationStage(),
         TranscriptionStage(),

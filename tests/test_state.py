@@ -82,6 +82,33 @@ class StateTests(unittest.TestCase):
         self.assertEqual(record.artifacts["artifact"], "value")
         self.assertIsNotNone(record.completed_at)
 
+    def test_stage_status_update_can_clear_message_and_artifacts(self) -> None:
+        manifest = build_manifest(
+            "demo",
+            Path("/tmp/demo-job"),
+            SourceMedia(video_path=Path("/tmp/video.mp4")),
+            PipelineSettings(),
+        )
+        with_artifacts = update_stage_status(
+            manifest,
+            StageName.TRANSLATION,
+            StageStatus.FAILED,
+            "previous failure",
+            {"artifact": "value"},
+        )
+
+        cleared = update_stage_status(
+            with_artifacts,
+            StageName.TRANSLATION,
+            StageStatus.COMPLETED,
+            "",
+            {},
+        )
+
+        record = next(item for item in cleared.stage_records if item.name == StageName.TRANSLATION)
+        self.assertEqual(record.message, "")
+        self.assertEqual(record.artifacts, {})
+
 
 if __name__ == "__main__":
     unittest.main()

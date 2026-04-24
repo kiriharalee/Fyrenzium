@@ -30,7 +30,7 @@ Source Video
 
 | Requirement | Notes |
 |---|---|
-| **Python 3.9+** | Core repo code uses stdlib only |
+| **Python 3.14+** | Core repo code uses stdlib only |
 | **FFmpeg** | Must be on `PATH` |
 | **Demucs** *(optional)* | Auto-detected for source separation if installed |
 | **Custom separation backend** *(optional)* | Supported via `source_separation_command` if you do not use Demucs |
@@ -46,7 +46,7 @@ Source Video
 ```bash
 export ELEVENLABS_API_KEY="..."
 export OPENROUTER_API_KEY="..."
-python3 dubbing_pipeline.py
+python3.14 dubbing_pipeline.py
 ```
 
 The wizard walks you through:
@@ -91,7 +91,7 @@ Default clone duration settings are 60 seconds minimum, 120 seconds target, and 
 ### 4. Alignment Overflow
 **`{job}/05_alignment/alignment_issues.json`**
 
-If a synthesized segment would need more stretching than the configured `max_stretch_ratio` allows, alignment stops and records the issue. Shorten the translation or adjust timing settings, then rerun.
+If a synthesized segment would need more stretching than the configured `max_duration_stretch` allows, alignment stops and records the issue. Shorten the translation or adjust timing settings, then rerun.
 
 ### 5. Source Separation Setup Problems
 If Demucs is not available, or a configured separation command fails, the pipeline stops with instructions. Install/fix Demucs or update `source_separation_command` and rerun.
@@ -262,7 +262,7 @@ Columns:
 Run the unit test suite with:
 
 ```bash
-python3 -m unittest discover -s tests
+python3.14 -m unittest discover -s tests
 ```
 
 The repository currently includes tests for stage behavior, manifest persistence, and review CSV round-tripping.
@@ -272,7 +272,6 @@ The repository currently includes tests for stage behavior, manifest persistence
 ## Notes
 
 - Core HTTP/API calls use `urllib` from the Python standard library
-- Timing behavior is configurable through settings such as syllables-per-second, max stretch ratio, segment gap threshold, and segment duration limits
+- Timing behavior is configurable through settings such as syllables-per-second, max duration stretch, segment gap threshold, and segment duration limits
 - Voice prep can automatically clone each detected speaker from merged clean sample audio, but manual intervention is still possible when clone creation needs review
 - External tools and APIs are wrapped with explicit error messages intended to make reruns and recovery easier
-

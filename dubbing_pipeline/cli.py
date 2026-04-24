@@ -6,8 +6,8 @@ import argparse
 import getpass
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
 
 from .models import PipelineSettings, SourceMedia
 from .pipeline import load_runner
@@ -23,7 +23,7 @@ from .state import (
 )
 
 
-def prompt_text(prompt: str, default: Optional[str] = None, required: bool = True) -> str:
+def prompt_text(prompt: str, default: str | None = None, required: bool = True) -> str:
     suffix = f" [{default}]" if default else ""
     while True:
         value = input(f"{prompt}{suffix}: ").strip()
@@ -49,7 +49,7 @@ def prompt_yes_no(prompt: str, default: bool = True) -> bool:
         print("Please answer yes or no.")
 
 
-def prompt_int(prompt: str, default: Optional[int] = None) -> Optional[int]:
+def prompt_int(prompt: str, default: int | None = None) -> int | None:
     suffix = f" [{default}]" if default is not None else ""
     while True:
         value = input(f"{prompt}{suffix}: ").strip()
@@ -72,7 +72,7 @@ def prompt_float(prompt: str, default: float) -> float:
             print("Please enter a number.")
 
 
-def prompt_csv(prompt: str, default: Optional[List[str]] = None) -> List[str]:
+def prompt_csv(prompt: str, default: list[str] | None = None) -> list[str]:
     default = default or []
     default_text = ",".join(default)
     raw = prompt_text(prompt, default_text, required=False)
@@ -81,7 +81,7 @@ def prompt_csv(prompt: str, default: Optional[List[str]] = None) -> List[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def prompt_path(prompt: str, default: Optional[Path] = None, must_exist: bool = False) -> Path:
+def prompt_path(prompt: str, default: Path | None = None, must_exist: bool = False) -> Path:
     while True:
         value = prompt_text(prompt, str(default) if default else None)
         path = Path(value).expanduser()
@@ -113,8 +113,8 @@ def build_settings(
     elevenlabs_tts_model: str,
     translation_model: str,
     source_separation_command: str = "",
-    scribe_keyterms: Optional[Sequence[str]] = None,
-    translation_glossary: Optional[Sequence[str]] = None,
+    scribe_keyterms: Sequence[str] | None = None,
+    translation_glossary: Sequence[str] | None = None,
     auto_approve_transcript_review: bool = False,
     auto_approve_translation_review: bool = False,
     auto_voice_id: str = "",
@@ -125,7 +125,7 @@ def build_settings(
     voice_clone_max_seconds: float = 300.0,
     voice_clone_remove_background_noise: bool = False,
     allow_alignment_overflow: bool = False,
-    estimated_speakers: Optional[int] = None,
+    estimated_speakers: int | None = None,
     syllables_per_second: float = 4.5,
     max_duration_stretch: float = 0.15,
     low_confidence_threshold: float = 0.75,
@@ -278,8 +278,8 @@ def update_voice_mappings(job_dir: Path) -> None:
     save_manifest(manifest)
 
 
-def collect_api_keys(settings: PipelineSettings, *, non_interactive: bool = False) -> Dict[str, str]:
-    api_keys: Dict[str, str] = {}
+def collect_api_keys(settings: PipelineSettings, *, non_interactive: bool = False) -> dict[str, str]:
+    api_keys: dict[str, str] = {}
     required = {
         "elevenlabs": ("ElevenLabs API key", settings.elevenlabs_api_key_env),
         "openrouter": ("OpenRouter API key", settings.openrouter_api_key_env),
@@ -295,7 +295,7 @@ def collect_api_keys(settings: PipelineSettings, *, non_interactive: bool = Fals
     return api_keys
 
 
-def maybe_assign_auto_voice(job_dir: Path, api_keys: Dict[str, str], *, auto_select_voice: bool) -> None:
+def maybe_assign_auto_voice(job_dir: Path, api_keys: dict[str, str], *, auto_select_voice: bool) -> None:
     manifest = load_manifest(job_dir)
     if not auto_select_voice:
         return
@@ -384,25 +384,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--voice-clone-prefix",
-        default="fyrenzium",
+        default=None,
         help="Prefix used when naming automatically created ElevenLabs voice clones.",
     )
     parser.add_argument(
         "--voice-clone-min-seconds",
         type=float,
-        default=60.0,
+        default=None,
         help="Minimum combined clean sample duration per speaker for automatic cloning.",
     )
     parser.add_argument(
         "--voice-clone-target-seconds",
         type=float,
-        default=120.0,
+        default=None,
         help="Target combined clean sample duration per speaker for automatic cloning.",
     )
     parser.add_argument(
         "--voice-clone-max-seconds",
         type=float,
-        default=300.0,
+        default=None,
         help="Maximum combined clean sample duration per speaker for automatic cloning.",
     )
     parser.add_argument(
@@ -427,7 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--translation-model",
-        default="minimax/minimax-m2.5:free",
+        default=None,
         help="OpenRouter model used for translation.",
     )
     parser.add_argument(
@@ -479,16 +479,16 @@ def build_settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         openrouter_api_key_env=args.openrouter_api_key_env,
         elevenlabs_scribe_model=elevenlabs_scribe_model,
         elevenlabs_tts_model=elevenlabs_tts_model,
-        translation_model=args.translation_model,
+        translation_model=args.translation_model or "minimax/minimax-m2.5:free",
         source_separation_command=args.source_separation_command,
         auto_approve_transcript_review=args.one_run,
         auto_approve_translation_review=args.one_run,
         auto_voice_id=args.voice_id or "",
         auto_clone_voices=not args.disable_auto_clone_voices,
-        voice_clone_prefix=args.voice_clone_prefix,
-        voice_clone_min_seconds=args.voice_clone_min_seconds,
-        voice_clone_target_seconds=args.voice_clone_target_seconds,
-        voice_clone_max_seconds=args.voice_clone_max_seconds,
+        voice_clone_prefix=args.voice_clone_prefix or "fyrenzium",
+        voice_clone_min_seconds=args.voice_clone_min_seconds if args.voice_clone_min_seconds is not None else 60.0,
+        voice_clone_target_seconds=args.voice_clone_target_seconds if args.voice_clone_target_seconds is not None else 120.0,
+        voice_clone_max_seconds=args.voice_clone_max_seconds if args.voice_clone_max_seconds is not None else 300.0,
         voice_clone_remove_background_noise=bool(args.voice_clone_remove_background_noise),
         allow_alignment_overflow=bool(args.allow_alignment_overflow or args.one_run),
         estimated_speakers=estimated_speakers,
@@ -522,22 +522,22 @@ def apply_noninteractive_overrides(job_dir: Path, args: argparse.Namespace) -> N
     if args.disable_auto_clone_voices and manifest.settings.auto_clone_voices:
         manifest.settings.auto_clone_voices = False
         changed = True
-    if args.voice_clone_prefix and manifest.settings.voice_clone_prefix != args.voice_clone_prefix:
+    if args.voice_clone_prefix is not None and manifest.settings.voice_clone_prefix != args.voice_clone_prefix:
         manifest.settings.voice_clone_prefix = args.voice_clone_prefix
         changed = True
-    if manifest.settings.voice_clone_min_seconds != args.voice_clone_min_seconds:
+    if args.voice_clone_min_seconds is not None and manifest.settings.voice_clone_min_seconds != args.voice_clone_min_seconds:
         manifest.settings.voice_clone_min_seconds = args.voice_clone_min_seconds
         changed = True
-    if manifest.settings.voice_clone_target_seconds != args.voice_clone_target_seconds:
+    if args.voice_clone_target_seconds is not None and manifest.settings.voice_clone_target_seconds != args.voice_clone_target_seconds:
         manifest.settings.voice_clone_target_seconds = args.voice_clone_target_seconds
         changed = True
-    if manifest.settings.voice_clone_max_seconds != args.voice_clone_max_seconds:
+    if args.voice_clone_max_seconds is not None and manifest.settings.voice_clone_max_seconds != args.voice_clone_max_seconds:
         manifest.settings.voice_clone_max_seconds = args.voice_clone_max_seconds
         changed = True
     if args.voice_clone_remove_background_noise and not manifest.settings.voice_clone_remove_background_noise:
         manifest.settings.voice_clone_remove_background_noise = True
         changed = True
-    if args.translation_model and manifest.settings.translation_model != args.translation_model:
+    if args.translation_model is not None and manifest.settings.translation_model != args.translation_model:
         manifest.settings.translation_model = args.translation_model
         changed = True
     if args.max_duration_stretch is not None and manifest.settings.max_duration_stretch != args.max_duration_stretch:
@@ -604,7 +604,7 @@ def run_interactive() -> int:
     return 0
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         return run_interactive()

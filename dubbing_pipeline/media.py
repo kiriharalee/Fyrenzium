@@ -7,13 +7,12 @@ pipeline stages stay focused on orchestration.
 from __future__ import annotations
 
 import math
-import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
 
 
 class MediaToolError(RuntimeError):
@@ -24,17 +23,17 @@ class MediaToolError(RuntimeError):
 class CommandResult:
     """Structured subprocess result."""
 
-    args: Tuple[str, ...]
+    args: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
 
 
-def which(program: str) -> Optional[str]:
+def which(program: str) -> str | None:
     return shutil.which(program)
 
 
-def require_executable(program: str, hint: Optional[str] = None) -> str:
+def require_executable(program: str, hint: str | None = None) -> str:
     resolved = which(program)
     if not resolved:
         message = f"Required executable '{program}' was not found on PATH."
@@ -47,8 +46,8 @@ def require_executable(program: str, hint: Optional[str] = None) -> str:
 def run_command(
     args: Sequence[str],
     *,
-    cwd: Optional[Path] = None,
-    env: Optional[Dict[str, str]] = None,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
     capture_output: bool = True,
     check: bool = True,
 ) -> CommandResult:
@@ -83,7 +82,7 @@ def file_exists(path: Path) -> bool:
     return path.exists() and path.is_file()
 
 
-def chunk_filter_value(value: float, minimum: float = 0.5, maximum: float = 2.0) -> List[float]:
+def chunk_filter_value(value: float, minimum: float = 0.5, maximum: float = 2.0) -> list[float]:
     """Split a speed factor into ffmpeg atempo-safe pieces.
 
     ffmpeg's atempo filter accepts 0.5-2.0 per filter. This helper decomposes
@@ -93,7 +92,7 @@ def chunk_filter_value(value: float, minimum: float = 0.5, maximum: float = 2.0)
     if value <= 0:
         raise ValueError("speed factor must be positive")
 
-    pieces: List[float] = []
+    pieces: list[float] = []
     remaining = value
     while remaining > maximum:
         pieces.append(maximum)
@@ -166,7 +165,7 @@ def run_ffmpeg_filter(
 ) -> Path:
     ffmpeg = require_executable("ffmpeg", "Install FFmpeg to process media.")
     ensure_parent_dir(output)
-    command: List[str] = [ffmpeg, "-y"]
+    command: list[str] = [ffmpeg, "-y"]
     for item in inputs:
         command.extend(["-i", str(item)])
     command.extend(["-filter_complex", filter_complex])
@@ -210,7 +209,7 @@ def concatenate_audio(inputs: Sequence[Path], output_audio: Path) -> Path:
         raise MediaToolError("concatenate_audio requires at least one input.")
     ffmpeg = require_executable("ffmpeg", "Install FFmpeg to concatenate media.")
     ensure_parent_dir(output_audio)
-    command: List[str] = [ffmpeg, "-y"]
+    command: list[str] = [ffmpeg, "-y"]
     for item in inputs:
         command.extend(["-i", str(item)])
     filter_parts = [f"[{index}:a]" for index in range(len(inputs))]
@@ -222,10 +221,10 @@ def concatenate_audio(inputs: Sequence[Path], output_audio: Path) -> Path:
 
 def merge_audio_segments(
     input_audio: Path,
-    segments: Sequence[Tuple[float, float]],
+    segments: Sequence[tuple[float, float]],
     output_audio: Path,
 ) -> Path:
-    cleaned_segments: List[Tuple[float, float]] = []
+    cleaned_segments: list[tuple[float, float]] = []
     for start_seconds, end_seconds in segments:
         start = max(0.0, float(start_seconds))
         end = max(start, float(end_seconds))
@@ -273,7 +272,7 @@ def detect_nonsilent_spans(
     *,
     noise_db: float = -35.0,
     minimum_silence_seconds: float = 0.35,
-) -> List[Tuple[float, float]]:
+) -> list[tuple[float, float]]:
     ffmpeg = require_executable("ffmpeg", "Install FFmpeg to analyze silence.")
     result = run_command(
         [
@@ -289,7 +288,7 @@ def detect_nonsilent_spans(
         ]
     )
     log_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
-    spans: List[Tuple[float, float]] = []
+    spans: list[tuple[float, float]] = []
     current_start = 0.0
     for line in log_output.splitlines():
         start_match = re.search(r"silence_start:\s*([0-9.]+)", line)
@@ -309,7 +308,7 @@ def detect_nonsilent_spans(
 
 def rms_level_db(
     input_audio: Path,
-) -> Optional[float]:
+) -> float | None:
     ffmpeg = require_executable("ffmpeg", "Install FFmpeg to analyze audio loudness.")
     result = run_command(
         [

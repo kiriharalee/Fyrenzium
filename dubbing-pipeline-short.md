@@ -34,8 +34,9 @@ For operational details, file locations, and workflow notes, use `README.md` as 
 
 ### 6. Voice Prep
 - Extracts per-speaker sample clips into `04_voice_prep/speaker_samples/`
+- Can create ElevenLabs instant voice clones automatically when enabled
 - Writes `voice_prep_manifest.json`
-- Expects voice creation or selection to happen outside this repository
+- Stops for manual voice assignment when cloning is disabled or cannot complete
 
 ### 7. Synthesis
 - Uses **ElevenLabs TTS** for each approved segment
@@ -63,7 +64,7 @@ For operational details, file locations, and workflow notes, use `README.md` as 
 | 3. Transcript review | Manual CSV approval |
 | 4. Translation | OpenRouter model |
 | 5. Translation review | Manual CSV approval |
-| 6. Voice prep | Speaker sample extraction + manual voice mapping |
+| 6. Voice prep | Speaker sample extraction + optional voice cloning |
 | 7. Synthesis | ElevenLabs TTS |
 | 8. Alignment | Rubber Band or FFmpeg |
 | 9. Final mix | FFmpeg-based render |
@@ -75,4 +76,3 @@ For operational details, file locations, and workflow notes, use `README.md` as 
 - The implemented workflow is designed for **Russian-to-English dubbing**
 - Lip sync is **not** part of the current repository
 - The jobs root is chosen at runtime; outputs are tracked through each job’s `manifest.json`
-

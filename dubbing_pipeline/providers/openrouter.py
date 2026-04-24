@@ -12,8 +12,9 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any
 
 DEFAULT_OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "minimax/minimax-m2.5:free"
@@ -26,7 +27,7 @@ class OpenRouterError(RuntimeError):
 class OpenRouterAPIError(OpenRouterError):
     """Raised when OpenRouter returns a non-success response."""
 
-    def __init__(self, status_code: int, message: str, body: Optional[str] = None):
+    def __init__(self, status_code: int, message: str, body: str | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
@@ -43,12 +44,12 @@ class ChatMessage:
     role: str
     content: str
 
-    def as_dict(self) -> Dict[str, str]:
+    def as_dict(self) -> dict[str, str]:
         return {"role": self.role, "content": self.content}
 
 
-def _normalize_messages(messages: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    normalized: List[Dict[str, Any]] = []
+def _normalize_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role", "")).strip()
         if not role:
@@ -71,7 +72,7 @@ class OpenRouterClient:
         api_base: str = DEFAULT_OPENROUTER_API_BASE,
         timeout: float = 120.0,
         app_name: str = "Fyrenzium",
-        app_url: Optional[str] = None,
+        app_url: str | None = None,
         user_agent: str = "Fyrenzium/1.0",
     ) -> None:
         if not api_key:
@@ -99,12 +100,12 @@ class OpenRouterClient:
         method: str,
         path: str,
         *,
-        body: Optional[Mapping[str, Any]] = None,
-        extra_headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        body: Mapping[str, Any] | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.api_base}{path}"
-        headers: Dict[str, str] = {
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": self.user_agent,
@@ -138,18 +139,18 @@ class OpenRouterClient:
         messages: Sequence[Mapping[str, Any]],
         *,
         model: str = DEFAULT_OPENROUTER_MODEL,
-        temperature: Optional[float] = 0.0,
-        max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        stop: Optional[Sequence[str]] = None,
-        response_format: Optional[Mapping[str, Any]] = None,
-        extra_body: Optional[Mapping[str, Any]] = None,
-        extra_headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        temperature: float | None = 0.0,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        stop: Sequence[str] | None = None,
+        response_format: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         """Call OpenRouter's OpenAI-compatible chat completions endpoint."""
 
-        body: Dict[str, Any] = {
+        body: dict[str, Any] = {
             "model": model,
             "messages": _normalize_messages(messages),
         }
@@ -179,14 +180,14 @@ class OpenRouterClient:
         source_text: str,
         *,
         system_prompt: str,
-        user_prompt: Optional[str] = None,
+        user_prompt: str | None = None,
         model: str = DEFAULT_OPENROUTER_MODEL,
-        temperature: Optional[float] = 0.0,
-        max_tokens: Optional[int] = None,
-        response_format: Optional[Mapping[str, Any]] = None,
-        extra_body: Optional[Mapping[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        temperature: float | None = 0.0,
+        max_tokens: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         """Convenience helper for text translation prompts.
 
         The caller still receives the full raw OpenRouter response so downstream
@@ -228,4 +229,3 @@ class OpenRouterClient:
         if content is None:
             return ""
         return str(content)
-

@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 from .models import (
     JobManifest,
@@ -47,7 +47,7 @@ def manifest_path(job_dir: Path) -> Path:
     return job_dir / MANIFEST_FILENAME
 
 
-def default_stage_records() -> List[StageRecord]:
+def default_stage_records() -> list[StageRecord]:
     return [StageRecord(name=stage) for stage in StageName]
 
 
@@ -71,7 +71,7 @@ def build_manifest(
     )
 
 
-def stage_lookup(manifest: JobManifest) -> Dict[StageName, StageRecord]:
+def stage_lookup(manifest: JobManifest) -> dict[StageName, StageRecord]:
     return {record.name: record for record in manifest.stage_records}
 
 
@@ -79,11 +79,11 @@ def update_stage_status(
     manifest: JobManifest,
     stage_name: StageName,
     status: StageStatus,
-    message: str = "",
-    artifacts: Optional[Dict[str, str]] = None,
+    message: str | None = "",
+    artifacts: dict[str, str] | None = None,
 ) -> JobManifest:
     timestamp = utc_now_iso()
-    updated_records: List[StageRecord] = []
+    updated_records: list[StageRecord] = []
     for record in manifest.stage_records:
         if record.name == stage_name:
             started_at = record.started_at
@@ -103,8 +103,8 @@ def update_stage_status(
                     status=status,
                     started_at=started_at,
                     completed_at=completed_at,
-                    message=message or record.message,
-                    artifacts=artifacts or record.artifacts,
+                    message=record.message if message is None else message,
+                    artifacts=record.artifacts if artifacts is None else artifacts,
                 )
             )
         else:
@@ -112,11 +112,11 @@ def update_stage_status(
     return replace(manifest, stage_records=updated_records, updated_at=timestamp)
 
 
-def to_json_dict(manifest: JobManifest) -> Dict[str, Any]:
+def to_json_dict(manifest: JobManifest) -> dict[str, Any]:
     return manifest.to_dict()
 
 
-def from_json_dict(data: Dict[str, Any]) -> JobManifest:
+def from_json_dict(data: dict[str, Any]) -> JobManifest:
     source_media_data = data["source_media"]
     settings_data = data["settings"]
     stage_records_data = data.get("stage_records", [])
@@ -164,7 +164,7 @@ def from_json_dict(data: Dict[str, Any]) -> JobManifest:
         segment_gap_seconds=float(settings_data.get("segment_gap_seconds", 0.8)),
         max_segment_seconds=float(settings_data.get("max_segment_seconds", 8.0)),
     )
-    stage_records: List[StageRecord] = []
+    stage_records: list[StageRecord] = []
     for record_data in stage_records_data:
         stage_records.append(
             StageRecord(
@@ -205,17 +205,17 @@ def load_manifest(job_dir: Path) -> JobManifest:
     return from_json_dict(payload)
 
 
-def jobs_root(default: Optional[Path] = None) -> Path:
+def jobs_root(default: Path | None = None) -> Path:
     return ensure_directory(default or (Path.cwd() / "jobs"))
 
 
-def create_job_dir(job_name: str, root: Optional[Path] = None) -> Path:
+def create_job_dir(job_name: str, root: Path | None = None) -> Path:
     root_dir = jobs_root(root)
     job_dir = root_dir / slugify(job_name)
     return ensure_directory(job_dir)
 
 
-def list_existing_jobs(root: Optional[Path] = None) -> List[Path]:
+def list_existing_jobs(root: Path | None = None) -> list[Path]:
     root_dir = jobs_root(root)
     return sorted(
         [path for path in root_dir.iterdir() if path.is_dir() and manifest_path(path).exists()]

@@ -15,15 +15,14 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any
 
 DEFAULT_API_BASE = "https://api.elevenlabs.io"
 DEFAULT_SCRIBE_MODEL_ID = "scribe_v2"
 DEFAULT_TTS_MODEL_ID = "eleven_multilingual_v2"
-
-AudioSource = Union[str, Path, bytes]
 
 
 class ElevenLabsError(RuntimeError):
@@ -33,7 +32,7 @@ class ElevenLabsError(RuntimeError):
 class ElevenLabsAPIError(ElevenLabsError):
     """Raised when the ElevenLabs API returns a non-success response."""
 
-    def __init__(self, status_code: int, message: str, body: Optional[str] = None):
+    def __init__(self, status_code: int, message: str, body: str | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
@@ -49,7 +48,7 @@ class ElevenLabsResponse:
 
     status_code: int
     content_type: str
-    body: Union[bytes, Dict[str, Any]]
+    body: bytes | dict[str, Any] | str
 
 
 def _guess_mime_type(filename: str) -> str:
@@ -57,7 +56,7 @@ def _guess_mime_type(filename: str) -> str:
     return mime_type or "application/octet-stream"
 
 
-def _read_audio_source(source: AudioSource, filename: Optional[str] = None) -> Tuple[str, bytes]:
+def _read_audio_source(source: str | Path | bytes, filename: str | None = None) -> tuple[str, bytes]:
     if isinstance(source, bytes):
         resolved_name = filename or "audio.bin"
         return resolved_name, source
@@ -82,8 +81,8 @@ def _stringify(value: Any) -> str:
 
 def _build_multipart_form(
     fields: Mapping[str, Any],
-    files: Mapping[str, Union[Tuple[str, bytes, str], Sequence[Tuple[str, bytes, str]]]],
-) -> Tuple[bytes, str]:
+    files: Mapping[str, tuple[str, bytes, str] | Sequence[tuple[str, bytes, str]]],
+) -> tuple[bytes, str]:
     boundary = base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
     parts = []
 
@@ -149,24 +148,22 @@ class ElevenLabsClient:
         method: str,
         path: str,
         *,
-        json_body: Optional[Mapping[str, Any]] = None,
-        multipart_fields: Optional[Mapping[str, Any]] = None,
-        multipart_files: Optional[
-            Mapping[str, Union[Tuple[str, bytes, str], Sequence[Tuple[str, bytes, str]]]]
-        ] = None,
+        json_body: Mapping[str, Any] | None = None,
+        multipart_fields: Mapping[str, Any] | None = None,
+        multipart_files: Mapping[str, tuple[str, bytes, str] | Sequence[tuple[str, bytes, str]]] | None = None,
         accept_json: bool = True,
-        extra_headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[float] = None,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> ElevenLabsResponse:
         url = f"{self.api_base}{path}"
-        headers: Dict[str, str] = {
+        headers: dict[str, str] = {
             "xi-api-key": self.api_key,
             "User-Agent": self.user_agent,
         }
         if extra_headers:
             headers.update(extra_headers)
 
-        data: Optional[bytes] = None
+        data: bytes | None = None
         if json_body is not None and (multipart_fields or multipart_files):
             raise ValueError("json_body cannot be combined with multipart data")
         if json_body is not None:
@@ -203,13 +200,13 @@ class ElevenLabsClient:
         except urllib.error.URLError as exc:
             raise ElevenLabsError(f"ElevenLabs request failed: {exc.reason}") from exc
 
-    def list_models(self) -> Dict[str, Any]:
+    def list_models(self) -> dict[str, Any]:
         response = self._request("GET", "/v1/models", accept_json=True)
         if isinstance(response.body, dict):
             return response.body
         raise ElevenLabsError("ElevenLabs model list did not return JSON")
 
-    def list_voices(self) -> Dict[str, Any]:
+    def list_voices(self) -> dict[str, Any]:
         response = self._request("GET", "/v1/voices", accept_json=True)
         if isinstance(response.body, dict):
             return response.body
@@ -217,17 +214,17 @@ class ElevenLabsClient:
 
     def transcribe_audio(
         self,
-        audio: AudioSource,
+        audio: str | Path | bytes,
         *,
-        filename: Optional[str] = None,
+        filename: str | None = None,
         model_id: str = DEFAULT_SCRIBE_MODEL_ID,
-        language_code: Optional[str] = None,
+        language_code: str | None = None,
         diarize: bool = True,
-        num_speakers: Optional[int] = None,
-        keyterms: Optional[Sequence[str]] = None,
-        extra_fields: Optional[Mapping[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        num_speakers: int | None = None,
+        keyterms: Sequence[str] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         """Submit audio for transcription.
 
         The ElevenLabs STT API response is returned as decoded JSON so callers can
@@ -235,7 +232,7 @@ class ElevenLabsClient:
         """
 
         audio_name, audio_bytes = _read_audio_source(audio, filename)
-        fields: Dict[str, Any] = {
+        fields: dict[str, Any] = {
             "model_id": model_id,
             "diarize": diarize,
         }
@@ -266,12 +263,12 @@ class ElevenLabsClient:
         self,
         *,
         name: str,
-        audio_files: Sequence[AudioSource],
-        description: Optional[str] = None,
-        labels: Optional[Mapping[str, str]] = None,
+        audio_files: Sequence[str | Path | bytes],
+        description: str | None = None,
+        labels: Mapping[str, str] | None = None,
         remove_background_noise: bool = False,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("name is required")
         if not audio_files:
@@ -283,7 +280,7 @@ class ElevenLabsClient:
             safe_name = audio_name or f"sample_{index}.wav"
             files.append((safe_name, audio_bytes, _guess_mime_type(safe_name)))
 
-        fields: Dict[str, Any] = {
+        fields: dict[str, Any] = {
             "name": name,
             "remove_background_noise": remove_background_noise,
         }
@@ -309,11 +306,11 @@ class ElevenLabsClient:
         text: str,
         voice_id: str,
         *,
-        model_id: Optional[str] = None,
-        output_format: Optional[str] = "mp3_44100_128",
-        voice_settings: Optional[Mapping[str, Any]] = None,
-        extra_body: Optional[Mapping[str, Any]] = None,
-        timeout: Optional[float] = None,
+        model_id: str | None = None,
+        output_format: str | None = "mp3_44100_128",
+        voice_settings: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> bytes:
         """Generate speech audio for the given voice."""
 
@@ -322,7 +319,7 @@ class ElevenLabsClient:
         if not voice_id:
             raise ValueError("voice_id is required")
 
-        body: Dict[str, Any] = {
+        body: dict[str, Any] = {
             "text": text,
             "model_id": model_id or self.default_model_id,
         }
@@ -350,13 +347,13 @@ class ElevenLabsClient:
         self,
         text: str,
         voice_id: str,
-        output_path: Union[str, Path],
+        output_path: str | Path,
         *,
-        model_id: Optional[str] = None,
-        output_format: Optional[str] = "mp3_44100_128",
-        voice_settings: Optional[Mapping[str, Any]] = None,
-        extra_body: Optional[Mapping[str, Any]] = None,
-        timeout: Optional[float] = None,
+        model_id: str | None = None,
+        output_format: str | None = "mp3_44100_128",
+        voice_settings: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Path:
         audio = self.synthesize_speech(
             text,

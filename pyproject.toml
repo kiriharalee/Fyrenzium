@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fyrenzium"
+version = "0.1.0"
+description = "Interactive, resumable Python CLI pipeline for Russian-to-English video dubbing."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+fyrenzium = "dubbing_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dubbing_pipeline*"]

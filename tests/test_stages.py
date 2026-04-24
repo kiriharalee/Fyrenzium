@@ -3,9 +3,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from dubbing_pipeline.cli import apply_noninteractive_overrides, build_parser
 from dubbing_pipeline.media import MediaToolError, extract_audio_from_video
-from dubbing_pipeline.models import PipelineSettings, SourceMedia, StageName, StageStatus, TranscriptWord
+from dubbing_pipeline.models import PipelineSettings, SourceMedia, StageName, StageStatus, TranscriptSegment, TranscriptWord
 from dubbing_pipeline.pipeline import PipelineRunner, StageResult, build_context
+from dubbing_pipeline.providers import ElevenLabsError
 from dubbing_pipeline.stages import (
     AlignmentStage,
     FinalMixStage,
@@ -15,12 +17,14 @@ from dubbing_pipeline.stages import (
     TranscriptionStage,
     TranscriptReviewStage,
     TranslationStage,
+    VoicePrepStage,
     build_segments,
     estimate_syllables,
     normalize_words_to_single_speaker,
     parse_translation_content,
+    transcript_segment_from_dict,
 )
-from dubbing_pipeline.state import build_manifest, save_manifest, update_stage_status
+from dubbing_pipeline.state import build_manifest, load_manifest, save_manifest, update_stage_status
 
 
 class StageHelperTests(unittest.TestCase):
@@ -34,6 +38,36 @@ class StageHelperTests(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[0].speaker, "speaker_1")
         self.assertEqual(segments[1].speaker, "speaker_2")
+
+    def test_build_segments_uses_configurable_confidence_threshold(self) -> None:
+        words = [
+            TranscriptWord(word="Privet", start_sec=0.0, end_sec=0.3, confidence=0.8, speaker="speaker_1"),
+            TranscriptWord(word="mir", start_sec=0.31, end_sec=0.5, confidence=0.8, speaker="speaker_1"),
+        ]
+
+        segments = build_segments(words, gap_threshold=0.4, max_segment_sec=5.0, low_confidence_threshold=0.9)
+
+        self.assertTrue(segments[0].needs_review)
+
+    def test_voice_prep_hydrates_transcript_words_from_json(self) -> None:
+        segment = TranscriptSegment(
+            segment_id="s0001",
+            speaker="speaker_1",
+            start_sec=0.0,
+            end_sec=2.0,
+            text="Privet mir",
+            words=[
+                TranscriptWord(word="Privet", start_sec=0.1, end_sec=0.4, speaker="speaker_1"),
+                TranscriptWord(word="mir", start_sec=0.5, end_sec=0.8, speaker="speaker_1"),
+            ],
+            confidence=0.95,
+        )
+
+        hydrated = transcript_segment_from_dict(segment.to_dict())
+        candidates = VoicePrepStage()._candidate_intervals([hydrated], low_confidence_threshold=0.75)
+
+        self.assertEqual(type(hydrated.words[0]), TranscriptWord)
+        self.assertEqual(candidates[0]["segment_id"], "s0001")
 
     def test_parse_translation_content_reads_json(self) -> None:
         self.assertEqual(parse_translation_content('{"translation":"hello"}'), "hello")
@@ -162,6 +196,34 @@ class StageHelperTests(unittest.TestCase):
         self.assertIn("source_separation_runner", result.message)
         self.assertIn("uvr5", result.message)
 
+    def test_resume_overrides_do_not_reset_saved_settings_when_flags_are_omitted(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(
+                    translation_model="custom/model",
+                    voice_clone_prefix="custom-prefix",
+                    voice_clone_min_seconds=12.0,
+                    voice_clone_target_seconds=24.0,
+                    voice_clone_max_seconds=48.0,
+                ),
+            )
+            save_manifest(manifest)
+            args = build_parser().parse_args(["--resume-job", str(job_dir)])
+
+            apply_noninteractive_overrides(job_dir, args)
+
+            loaded = load_manifest(job_dir)
+
+        self.assertEqual(loaded.settings.translation_model, "custom/model")
+        self.assertEqual(loaded.settings.voice_clone_prefix, "custom-prefix")
+        self.assertEqual(loaded.settings.voice_clone_min_seconds, 12.0)
+        self.assertEqual(loaded.settings.voice_clone_target_seconds, 24.0)
+        self.assertEqual(loaded.settings.voice_clone_max_seconds, 48.0)
+
     def test_source_separation_demucs_run_records_provenance(self) -> None:
         with TemporaryDirectory() as temp_dir:
             job_dir = Path(temp_dir) / "job1"
@@ -228,7 +290,7 @@ class StageHelperTests(unittest.TestCase):
         self.assertIn("source_separation_command", result.message)
         self.assertIn("/usr/bin/demucs --two-stems vocals", result.message)
 
-    def test_source_separation_retries_after_installing_soundfile(self) -> None:
+    def test_source_separation_reports_soundfile_remediation_without_installing(self) -> None:
         with TemporaryDirectory() as temp_dir:
             job_dir = Path(temp_dir) / "job1"
             source_audio = Path(temp_dir) / "source.wav"
@@ -248,33 +310,17 @@ class StageHelperTests(unittest.TestCase):
                 "/tmp/out/vocals.wav and format None.\n"
                 "torchaudio backend unavailable"
             )
-            call_counter = {"count": 0}
-
             def fake_demucs_run(args):
-                call_counter["count"] += 1
-                if call_counter["count"] == 1:
-                    raise backend_error
-                output_root = job_dir / "01_source" / "demucs_output" / "htdemucs" / "input_audio"
-                output_root.mkdir(parents=True, exist_ok=True)
-                (output_root / "vocals.wav").write_bytes(b"isolated-vocals")
-                (output_root / "no_vocals.wav").write_bytes(b"isolated-music")
+                raise backend_error
 
             with patch("dubbing_pipeline.stages.which", return_value="/usr/bin/demucs"), patch(
                 "dubbing_pipeline.stages.run_command", side_effect=fake_demucs_run
-            ), patch.object(SourceSeparationStage, "_has_soundfile_module", return_value=False), patch.object(
-                SourceSeparationStage,
-                "_install_soundfile_module",
-                return_value=(True, "Installed the missing soundfile package and retried Demucs automatically."),
-            ) as install_mock, patch.object(
-                SourceSeparationStage,
-                "_probe_audio",
-                return_value={"codec_name": "pcm_s16le", "channels": 2, "sample_rate": 44100, "duration": "1.0", "size": "16"},
-            ), patch.object(SourceSeparationStage, "_audio_peak_dbfs", return_value=-12.0):
+            ) as run_mock, patch.object(SourceSeparationStage, "_has_soundfile_module", return_value=False):
                 result = SourceSeparationStage().run(context)
 
-        self.assertEqual(result.status.value, "completed")
-        self.assertEqual(call_counter["count"], 2)
-        install_mock.assert_called_once()
+        self.assertEqual(result.status, StageStatus.NEEDS_REVIEW)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertIn("python -m pip install soundfile", result.message)
 
     def test_translation_stage_resumes_from_existing_review_csv(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -509,6 +555,73 @@ class StageHelperTests(unittest.TestCase):
         self.assertEqual(source_record.status, StageStatus.FAILED)
         self.assertEqual(source_record.message, "ffmpeg failed")
         self.assertEqual(followup_stage.run_calls, 0)
+
+    def test_pipeline_marks_elevenlabs_transcription_error_as_failed(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            vocals_path = job_dir / "01_source" / "vocals.wav"
+            vocals_path.parent.mkdir(parents=True, exist_ok=True)
+            vocals_path.write_bytes(b"audio")
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.SOURCE_SEPARATION,
+                StageStatus.COMPLETED,
+                "done",
+                {"vocals": str(vocals_path)},
+            )
+            save_manifest(manifest)
+
+            with patch(
+                "dubbing_pipeline.stages.ElevenLabsClient.transcribe_audio",
+                side_effect=ElevenLabsError("service unavailable"),
+            ):
+                runner = PipelineRunner(build_context(job_dir, {"elevenlabs": "test-key"}), [TranscriptionStage()])
+                final_manifest = runner.run(resume=True)
+
+        record = next(item for item in final_manifest.stage_records if item.name == StageName.TRANSCRIPTION)
+        self.assertEqual(record.status, StageStatus.FAILED)
+        self.assertIn("ElevenLabs transcription failed", record.message)
+
+    def test_pipeline_marks_elevenlabs_synthesis_error_as_failed(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_dir = Path(temp_dir) / "job1"
+            approved_translations = job_dir / "03_translation_review" / "translation_segments_approved.json"
+            approved_translations.parent.mkdir(parents=True, exist_ok=True)
+            approved_translations.write_text(
+                '[{"segment_id":"s0001","speaker":"speaker_1","start_sec":0.0,"end_sec":1.0,"source_text":"privet","translated_text":"hello"}]\n',
+                encoding="utf-8",
+            )
+            manifest = build_manifest(
+                "job1",
+                job_dir,
+                SourceMedia(video_path=Path("/tmp/video.mp4")),
+                PipelineSettings(speaker_voice_map={"speaker_1": "voice-123"}),
+            )
+            manifest = update_stage_status(
+                manifest,
+                StageName.TRANSLATION_REVIEW,
+                StageStatus.COMPLETED,
+                "done",
+                {"approved_translations": str(approved_translations)},
+            )
+            save_manifest(manifest)
+
+            with patch(
+                "dubbing_pipeline.stages.ElevenLabsClient.save_speech_to_file",
+                side_effect=ElevenLabsError("tts down"),
+            ):
+                runner = PipelineRunner(build_context(job_dir, {"elevenlabs": "test-key"}), [SynthesisStage()])
+                final_manifest = runner.run(resume=True)
+
+        record = next(item for item in final_manifest.stage_records if item.name == StageName.SYNTHESIS)
+        self.assertEqual(record.status, StageStatus.FAILED)
+        self.assertIn("ElevenLabs synthesis failed", record.message)
 
     def test_pipeline_persists_demucs_backend_error_as_needs_review(self) -> None:
         with TemporaryDirectory() as temp_dir:

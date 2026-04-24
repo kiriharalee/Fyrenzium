@@ -7,11 +7,10 @@ records in, CSV files out, and the inverse when resuming a job.
 from __future__ import annotations
 
 import csv
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Type, TypeVar, Union
-
-PathLike = Union[str, Path]
+from typing import Any
 
 TRANSCRIPT_REVIEW_FIELDS = [
     "segment_id",
@@ -39,9 +38,6 @@ TRANSLATION_REVIEW_FIELDS = [
     "approved",
     "notes",
 ]
-
-T = TypeVar("T")
-
 
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +79,7 @@ class TranscriptReviewRow:
     approved: bool = False
     notes: str = ""
 
-    def to_csv_row(self) -> Dict[str, str]:
+    def to_csv_row(self) -> dict[str, str]:
         return {
             "segment_id": self.segment_id,
             "speaker": self.speaker,
@@ -126,7 +122,7 @@ class TranslationReviewRow:
     approved: bool = False
     notes: str = ""
 
-    def to_csv_row(self) -> Dict[str, str]:
+    def to_csv_row(self) -> dict[str, str]:
         return {
             "segment_id": self.segment_id,
             "speaker": self.speaker,
@@ -160,7 +156,7 @@ class TranslationReviewRow:
         )
 
 
-def _write_rows(path: PathLike, fieldnames: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> Path:
+def _write_rows(path: str | Path, fieldnames: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> Path:
     output_path = Path(path)
     _ensure_parent_dir(output_path)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -171,33 +167,33 @@ def _write_rows(path: PathLike, fieldnames: Sequence[str], rows: Iterable[Mappin
     return output_path
 
 
-def _read_rows(path: PathLike) -> List[Dict[str, str]]:
+def _read_rows(path: str | Path) -> list[dict[str, str]]:
     input_path = Path(path)
     with input_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         return [dict(row) for row in reader]
 
 
-def write_transcript_review_csv(rows: Iterable[TranscriptReviewRow], path: PathLike) -> Path:
+def write_transcript_review_csv(rows: Iterable[TranscriptReviewRow], path: str | Path) -> Path:
     return _write_rows(path, TRANSCRIPT_REVIEW_FIELDS, (row.to_csv_row() for row in rows))
 
 
-def read_transcript_review_csv(path: PathLike) -> List[TranscriptReviewRow]:
+def read_transcript_review_csv(path: str | Path) -> list[TranscriptReviewRow]:
     return [TranscriptReviewRow.from_csv_row(row) for row in _read_rows(path)]
 
 
-def write_translation_review_csv(rows: Iterable[TranslationReviewRow], path: PathLike) -> Path:
+def write_translation_review_csv(rows: Iterable[TranslationReviewRow], path: str | Path) -> Path:
     return _write_rows(path, TRANSLATION_REVIEW_FIELDS, (row.to_csv_row() for row in rows))
 
 
-def read_translation_review_csv(path: PathLike) -> List[TranslationReviewRow]:
+def read_translation_review_csv(path: str | Path) -> list[TranslationReviewRow]:
     return [TranslationReviewRow.from_csv_row(row) for row in _read_rows(path)]
 
 
-def rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
+def rows_to_dicts(rows: Iterable[Any]) -> list[dict[str, Any]]:
     """Convert dataclass rows or dictionaries into plain dictionaries."""
 
-    converted: List[Dict[str, Any]] = []
+    converted: list[dict[str, Any]] = []
     for row in rows:
         if hasattr(row, "to_csv_row"):
             converted.append(dict(row.to_csv_row()))
@@ -208,4 +204,3 @@ def rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
         else:
             raise TypeError(f"unsupported row type: {type(row)!r}")
     return converted
-
